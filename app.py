@@ -5,9 +5,11 @@ Sends  PUT <host>/api/p_cap/instances/1/mode_command  with body
 [mode, [min_delay_ns, jitter, packetloss]]   e.g.  [1,[1000000,0,0.0007]]
 """
 
+import base64
 import collections
 import json
 import os
+import ssl
 import subprocess
 import sys
 import threading
@@ -32,11 +34,13 @@ DEFAULT_CONFIG = {
     "jitter_on": 0,
     "packetloss_on": 0.0007,
     "state": {leg: {f: False for f in FUNCS} for leg in LEGS},
+    "ptp": {"switch": "", "interface": "Ethernet47", "username": "", "password": ""},
 }
 
 app = Flask(__name__)
 lock = threading.Lock()
 online = {leg: None for leg in LEGS}   # None = unknown
+ptp_status = {"configured": False, "reachable": None, "port_up": None, "link": ""}
 log = collections.deque(maxlen=20)
 
 
@@ -53,6 +57,8 @@ def load_config():
             cfg["hosts"][leg] = saved.get("hosts", {}).get(leg, cfg["hosts"][leg])
             for f in FUNCS:
                 cfg["state"][leg][f] = bool(saved.get("state", {}).get(leg, {}).get(f, False))
+        for key in ("switch", "interface", "username", "password"):
+            cfg["ptp"][key] = saved.get("ptp", {}).get(key, cfg["ptp"][key])
     except (OSError, ValueError):
         pass
     return cfg
@@ -109,6 +115,67 @@ def send_command(cfg, leg, state):
     return ok, msg
 
 
+# ---------------------------------------------------------------- Arista eAPI
+def eapi_call(cfg, cmds):
+    """JSON-RPC runCmds against the Arista switch. Returns (ok, result_or_message)."""
+    p = cfg["ptp"]
+    host = p["switch"].strip()
+    if not host:
+        return False, "no switch configured"
+    url = host if host.startswith("http") else "https://" + host
+    url = url.rstrip("/") + "/command-api"
+    payload = {"jsonrpc": "2.0", "method": "runCmds", "id": "1",
+               "params": {"version": 1, "cmds": cmds, "format": "json"}}
+    auth = base64.b64encode(f"{p['username']}:{p['password']}".encode()).decode()
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Basic " + auth})
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE   # lab switches use self-signed certs
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        return False, "authentication failed" if e.code == 401 else f"HTTP {e.code}"
+    except Exception as e:
+        return False, str(e)
+    if "error" in data:
+        return False, data["error"].get("message", "eAPI error")
+    return True, data.get("result", [])
+
+
+def ptp_refresh(cfg):
+    """Read the real admin/link state of the PTP port from the switch."""
+    intf = cfg["ptp"]["interface"].strip()
+    if not cfg["ptp"]["switch"].strip() or not intf:
+        ptp_status.update({"configured": False, "reachable": None,
+                           "port_up": None, "link": ""})
+        return
+    ok, res = eapi_call(cfg, [f"show interfaces {intf} status"])
+    if not ok:
+        ptp_status.update({"configured": True, "reachable": False,
+                           "port_up": None, "link": str(res)})
+        return
+    try:
+        link = res[0]["interfaceStatuses"][intf].get("linkStatus", "unknown")
+    except (KeyError, IndexError, TypeError):
+        ptp_status.update({"configured": True, "reachable": True,
+                           "port_up": None, "link": "unexpected reply"})
+        return
+    ptp_status.update({"configured": True, "reachable": True,
+                       "port_up": link != "disabled", "link": link})
+
+
+def ptp_poller():
+    while True:
+        try:
+            ptp_refresh(load_config())
+        except Exception:
+            pass
+        time.sleep(PING_INTERVAL)
+
+
 # ---------------------------------------------------------------- ping thread
 def ping_host(host):
     h = host.strip()
@@ -139,8 +206,11 @@ def pinger():
 @app.get("/api/status")
 def api_status():
     cfg = load_config()
+    ptp = dict(ptp_status)
+    ptp["switch"] = cfg["ptp"]["switch"]
+    ptp["interface"] = cfg["ptp"]["interface"]
     return jsonify({"online": online, "hosts": cfg["hosts"],
-                    "state": cfg["state"], "log": list(log)})
+                    "state": cfg["state"], "ptp": ptp, "log": list(log)})
 
 
 @app.post("/api/toggle")
@@ -171,6 +241,24 @@ def api_resend():
         cfg = load_config()
         ok, msg = send_command(cfg, leg, cfg["state"][leg])
         return jsonify({"ok": ok, "msg": msg, "state": cfg["state"]})
+
+
+@app.post("/api/ptp")
+def api_ptp():
+    """Enable/disable the PTP port on the Arista switch (no shutdown / shutdown)."""
+    data = request.get_json(force=True)
+    on = bool(data.get("on"))
+    with lock:
+        cfg = load_config()
+        intf = cfg["ptp"]["interface"].strip()
+        cmd = "no shutdown" if on else "shutdown"
+        ok, res = eapi_call(cfg, ["enable", "configure",
+                                  f"interface {intf}", cmd])
+        msg = "OK" if ok else str(res)
+        log_line(f"PTP  {intf} {cmd}  →  {msg}")
+        if ok:
+            ptp_refresh(cfg)
+        return jsonify({"ok": ok, "msg": msg, "ptp": ptp_status})
 
 
 # ---------------------------------------------------------------- pages
@@ -213,6 +301,8 @@ INDEX_HTML = """<!doctype html>
   input:checked + .slider { background:#e0a100; }
   input:checked + .slider:before { transform:translateX(24px); }
   input:disabled + .slider { opacity:.4; cursor:wait; }
+  #ptpcard input:checked + .slider { background:#2e9e4f; }
+  .dot.warn { background:#e0a100; box-shadow:0 0 6px #e0a100; }
   .resend { margin-top:14px; width:100%; background:#2a2f38; color:#c8ccd2; border:none;
             border-radius:8px; padding:8px; font-size:13px; cursor:pointer; }
   .resend:hover { background:#343a45; }
@@ -249,6 +339,18 @@ INDEX_HTML = """<!doctype html>
     <button class="resend" onclick="resend('{{ leg }}')">Resend values</button>
   </div>
   {% endfor %}
+  <div class="card" id="ptpcard">
+    <div class="leghead">
+      <h2>Main PTP</h2>
+      <span class="pingstate"><span class="dot" id="dotPTP"></span><span id="pingPTP">–</span></span>
+    </div>
+    <div class="host" id="hostPTP"></div>
+    <div class="row">
+      <span>Port enabled</span>
+      <label class="switch"><input type="checkbox" id="swPTP"
+        onchange="ptpToggle(this)"><span class="slider"></span></label>
+    </div>
+  </div>
 </main>
 <div id="log"></div>
 <div id="toast"></div>
@@ -269,7 +371,43 @@ function apply(s) {
       document.getElementById("sw"+leg+"jitter").checked = s.state[leg].jitter;
     }
   }
+  applyPtp(s.ptp);
   document.getElementById("log").textContent = s.log.join("\\n") || "No commands sent yet.";
+}
+
+function applyPtp(p) {
+  const dot = document.getElementById("dotPTP");
+  const txt = document.getElementById("pingPTP");
+  const sw = document.getElementById("swPTP");
+  document.getElementById("hostPTP").textContent =
+    p.configured ? p.interface + " @ " + p.switch : "not configured – see Setup";
+  let cls = "", label = "–";
+  if (!p.configured)              { label = "–"; }
+  else if (p.reachable === false) { cls = "off";  label = "switch unreachable"; }
+  else if (p.port_up === true)    { cls = "on";   label = p.link === "connected" ? "up" : p.link; }
+  else if (p.port_up === false)   { cls = "warn"; label = "admin down"; }
+  else                            { label = "checking…"; }
+  dot.className = "dot " + cls;
+  txt.textContent = label;
+  if (!busy) sw.checked = p.port_up === true;
+  sw.disabled = busy || !p.configured || p.reachable === false;
+}
+
+async function ptpToggle(el) {
+  const want = el.checked;
+  if (!want && !confirm("Shut down the Main PTP port on the switch?")) {
+    el.checked = true;
+    return;
+  }
+  busy = true; el.disabled = true;
+  try {
+    const r = await (await fetch("/api/ptp", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({on: want})})).json();
+    if (!r.ok) { el.checked = !want; toast("Main PTP: " + r.msg); }
+  } catch (e) { el.checked = !want; toast("Server unreachable"); }
+  busy = false; el.disabled = false;
+  refresh();
 }
 
 async function refresh() {
@@ -361,6 +499,17 @@ SETUP_HTML = """<!doctype html>
   <input name="packetloss_on" value="{{ cfg['packetloss_on'] }}">
   <div class="hint">0 is sent when OFF, e.g. 0.0007</div>
 
+  <h3>Main PTP – Arista switch (eAPI)</h3>
+  <label>Switch – IP / host</label>
+  <input name="ptp_switch" value="{{ cfg['ptp']['switch'] }}">
+  <div class="hint">HTTPS with self-signed certificate accepted; leave empty to disable the card</div>
+  <label>Interface</label>
+  <input name="ptp_interface" value="{{ cfg['ptp']['interface'] }}">
+  <label>eAPI username</label>
+  <input name="ptp_username" value="{{ cfg['ptp']['username'] }}">
+  <label>eAPI password</label>
+  <input name="ptp_password" type="password" placeholder="(unchanged)">
+
   <h3>Advanced</h3>
   <label>API path</label>
   <input name="api_path" value="{{ cfg['api_path'] }}">
@@ -392,6 +541,11 @@ def setup():
                 cfg["min_delay_ns"] = parse_number(request.form["min_delay_ns"])
                 cfg["jitter_on"] = parse_number(request.form["jitter_on"])
                 cfg["packetloss_on"] = parse_number(request.form["packetloss_on"])
+                cfg["ptp"]["switch"] = request.form["ptp_switch"].strip()
+                cfg["ptp"]["interface"] = request.form["ptp_interface"].strip() or "Ethernet47"
+                cfg["ptp"]["username"] = request.form["ptp_username"].strip()
+                if request.form.get("ptp_password"):
+                    cfg["ptp"]["password"] = request.form["ptp_password"]
             except (ValueError, KeyError):
                 error = "Invalid number – please check your input."
             if not error:
@@ -407,4 +561,5 @@ if __name__ == "__main__":
     if not os.path.exists(CONFIG_FILE):
         save_config(load_config())
     threading.Thread(target=pinger, daemon=True).start()
+    threading.Thread(target=ptp_poller, daemon=True).start()
     app.run(host="0.0.0.0", port=8080, threaded=True)
