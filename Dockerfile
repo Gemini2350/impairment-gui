@@ -4,6 +4,7 @@ RUN pip install --no-cache-dir flask
 
 WORKDIR /app
 COPY app.py .
+COPY static ./static
 
 ENV DATA_DIR=/data
 RUN mkdir -p /data
