@@ -11,7 +11,7 @@ Body-Format: `[mode, [min_delay_ns, jitter, packetloss]]` — z.B. `[1,[1000000,
 docker compose up -d --build
 ```
 
-Danach im Browser: `http://<docker-host>:8080`
+Danach im Browser: `http://<docker-host>:9080`
 
 - **Hauptseite:** Ping-Status beider Legs (online/offline), je ein On/Off-Schalter für
   Packetloss und Jitter. ON sendet den konfigurierten Wert, OFF sendet 0 an dieser
