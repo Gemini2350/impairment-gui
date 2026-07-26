@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Web-GUI: Netzwerk-Impairment (Packetloss/Jitter) auf LEG A und LEG B schalten.
+"""Web GUI: toggle network impairment (packet loss / jitter) on LEG A and LEG B.
 
-Sendet  PUT <host>/api/p_cap/instances/1/mode_command  mit Body
-[mode, [min_delay_ns, jitter, packetloss]]   z.B.  [1,[1000000,0,0.0007]]
+Sends  PUT <host>/api/p_cap/instances/1/mode_command  with body
+[mode, [min_delay_ns, jitter, packetloss]]   e.g.  [1,[1000000,0,0.0007]]
 """
 
 import collections
@@ -19,8 +19,8 @@ from flask import Flask, jsonify, redirect, render_template_string, request
 
 DATA_DIR = os.environ.get("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
-PING_INTERVAL = 3          # Sekunden zwischen Ping-Runden
-HTTP_TIMEOUT = 5           # Timeout fuer PUT ans Geraet
+PING_INTERVAL = 3          # seconds between ping rounds
+HTTP_TIMEOUT = 5           # timeout for the PUT to the device
 LEGS = ("A", "B")
 FUNCS = ("packetloss", "jitter")
 
@@ -36,13 +36,13 @@ DEFAULT_CONFIG = {
 
 app = Flask(__name__)
 lock = threading.Lock()
-online = {leg: None for leg in LEGS}   # None = unbekannt
+online = {leg: None for leg in LEGS}   # None = unknown
 log = collections.deque(maxlen=20)
 
 
-# ---------------------------------------------------------------- Konfiguration
+# ---------------------------------------------------------------- configuration
 def load_config():
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # tiefe Kopie
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # deep copy
     try:
         with open(CONFIG_FILE) as f:
             saved = json.load(f)
@@ -63,11 +63,11 @@ def save_config(cfg):
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=2)
     except OSError as e:
-        log_line(f"Konfiguration konnte nicht gespeichert werden: {e}")
+        log_line(f"Could not save configuration: {e}")
 
 
 def parse_number(text):
-    """Int wenn moeglich, sonst Float. Erlaubt 1'000'000 / 1_000_000 / Leerzeichen."""
+    """Int if possible, float otherwise. Accepts 1'000'000 / 1_000_000 / spaces."""
     text = str(text).strip().replace("'", "").replace("_", "").replace(" ", "")
     try:
         return int(text)
@@ -79,7 +79,7 @@ def log_line(text):
     log.appendleft(time.strftime("%H:%M:%S  ") + text)
 
 
-# ---------------------------------------------------------------- Geraete-API
+# ---------------------------------------------------------------- device API
 def build_body(cfg, state):
     jitter = cfg["jitter_on"] if state["jitter"] else 0
     loss = cfg["packetloss_on"] if state["packetloss"] else 0
@@ -88,10 +88,10 @@ def build_body(cfg, state):
 
 
 def send_command(cfg, leg, state):
-    """PUT ans Geraet. Rueckgabe: (ok, meldung)."""
+    """PUT to the device. Returns (ok, message)."""
     host = cfg["hosts"][leg].strip()
     if not host:
-        return False, "keine Adresse konfiguriert"
+        return False, "no address configured"
     url = host if host.startswith("http") else "http://" + host
     url = url.rstrip("/") + cfg["api_path"]
     body = build_body(cfg, state)
@@ -109,7 +109,7 @@ def send_command(cfg, leg, state):
     return ok, msg
 
 
-# ---------------------------------------------------------------- Ping-Thread
+# ---------------------------------------------------------------- ping thread
 def ping_host(host):
     h = host.strip()
     for prefix in ("http://", "https://"):
@@ -135,7 +135,7 @@ def pinger():
         time.sleep(PING_INTERVAL)
 
 
-# ---------------------------------------------------------------- API-Routen
+# ---------------------------------------------------------------- API routes
 @app.get("/api/status")
 def api_status():
     cfg = load_config()
@@ -148,7 +148,7 @@ def api_toggle():
     data = request.get_json(force=True)
     leg, func = data.get("leg"), data.get("func")
     if leg not in LEGS or func not in FUNCS:
-        return jsonify({"ok": False, "msg": "ungültige Anfrage"}), 400
+        return jsonify({"ok": False, "msg": "invalid request"}), 400
     with lock:
         cfg = load_config()
         new_state = dict(cfg["state"][leg])
@@ -162,20 +162,20 @@ def api_toggle():
 
 @app.post("/api/resend")
 def api_resend():
-    """Aktuellen Sollzustand erneut ans Geraet senden (z.B. nach Geraete-Neustart)."""
+    """Re-send the current target state to the device (e.g. after a device reboot)."""
     data = request.get_json(force=True)
     leg = data.get("leg")
     if leg not in LEGS:
-        return jsonify({"ok": False, "msg": "ungültige Anfrage"}), 400
+        return jsonify({"ok": False, "msg": "invalid request"}), 400
     with lock:
         cfg = load_config()
         ok, msg = send_command(cfg, leg, cfg["state"][leg])
         return jsonify({"ok": ok, "msg": msg, "state": cfg["state"]})
 
 
-# ---------------------------------------------------------------- Seiten
+# ---------------------------------------------------------------- pages
 INDEX_HTML = """<!doctype html>
-<html lang="de"><head>
+<html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Impairment Control</title>
@@ -237,7 +237,7 @@ INDEX_HTML = """<!doctype html>
     </div>
     <div class="host" id="host{{ leg }}"></div>
     <div class="row">
-      <span>Packetloss</span>
+      <span>Packet loss</span>
       <label class="switch"><input type="checkbox" id="sw{{ leg }}packetloss"
         onchange="toggle('{{ leg }}','packetloss',this)"><span class="slider"></span></label>
     </div>
@@ -246,7 +246,7 @@ INDEX_HTML = """<!doctype html>
       <label class="switch"><input type="checkbox" id="sw{{ leg }}jitter"
         onchange="toggle('{{ leg }}','jitter',this)"><span class="slider"></span></label>
     </div>
-    <button class="resend" onclick="resend('{{ leg }}')">Werte erneut senden</button>
+    <button class="resend" onclick="resend('{{ leg }}')">Resend values</button>
   </div>
   {% endfor %}
 </main>
@@ -262,14 +262,14 @@ function apply(s) {
     const ping = document.getElementById("ping"+leg);
     const on = s.online[leg];
     dot.className = "dot " + (on === true ? "on" : on === false ? "off" : "");
-    ping.textContent = on === true ? "online" : on === false ? "offline" : "prüfe…";
+    ping.textContent = on === true ? "online" : on === false ? "offline" : "checking…";
     document.getElementById("host"+leg).textContent = s.hosts[leg];
     if (!busy) {
       document.getElementById("sw"+leg+"packetloss").checked = s.state[leg].packetloss;
       document.getElementById("sw"+leg+"jitter").checked = s.state[leg].jitter;
     }
   }
-  document.getElementById("log").textContent = s.log.join("\\n") || "Noch keine Kommandos gesendet.";
+  document.getElementById("log").textContent = s.log.join("\\n") || "No commands sent yet.";
 }
 
 async function refresh() {
@@ -289,7 +289,7 @@ async function toggle(leg, func, el) {
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({leg, func})})).json();
     if (!r.ok) { el.checked = !el.checked; toast("LEG "+leg+" "+func+": "+r.msg); }
-  } catch (e) { el.checked = !el.checked; toast("Server nicht erreichbar"); }
+  } catch (e) { el.checked = !el.checked; toast("Server unreachable"); }
   el.disabled = false; busy = false;
   refresh();
 }
@@ -300,7 +300,7 @@ async function resend(leg) {
       headers:{"Content-Type":"application/json"},
       body: JSON.stringify({leg})})).json();
     if (!r.ok) toast("LEG "+leg+": "+r.msg);
-  } catch (e) { toast("Server nicht erreichbar"); }
+  } catch (e) { toast("Server unreachable"); }
   refresh();
 }
 
@@ -310,7 +310,7 @@ setInterval(refresh, 2000);
 </body></html>"""
 
 SETUP_HTML = """<!doctype html>
-<html lang="de"><head>
+<html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Setup – Impairment Control</title>
@@ -341,34 +341,34 @@ SETUP_HTML = """<!doctype html>
 <body>
 <header>
   <h1>Setup</h1>
-  <a href="/">&#8592; zurück zur Steuerung</a>
+  <a href="/">&#8592; back to control</a>
 </header>
 <form method="post">
-  <h3 style="border:none;padding:0;margin-top:0">Geräte</h3>
-  <label>LEG A – IP / Host</label>
+  <h3 style="border:none;padding:0;margin-top:0">Devices</h3>
+  <label>LEG A – IP / host</label>
   <input name="host_A" value="{{ cfg['hosts']['A'] }}">
-  <label>LEG B – IP / Host</label>
+  <label>LEG B – IP / host</label>
   <input name="host_B" value="{{ cfg['hosts']['B'] }}">
 
-  <h3>Impairment-Werte</h3>
-  <label>Min. Delay (ns)</label>
+  <h3>Impairment values</h3>
+  <label>Min. delay (ns)</label>
   <input name="min_delay_ns" value="{{ cfg['min_delay_ns'] }}">
-  <div class="hint">wird immer gesendet, z.B. 1'000'000</div>
-  <label>Jitter (Wert bei ON)</label>
+  <div class="hint">always sent, e.g. 1'000'000</div>
+  <label>Jitter (value when ON)</label>
   <input name="jitter_on" value="{{ cfg['jitter_on'] }}">
-  <div class="hint">bei OFF wird 0 gesendet</div>
-  <label>Packetloss (Wert bei ON)</label>
+  <div class="hint">0 is sent when OFF</div>
+  <label>Packet loss (value when ON)</label>
   <input name="packetloss_on" value="{{ cfg['packetloss_on'] }}">
-  <div class="hint">bei OFF wird 0 gesendet, z.B. 0.0007</div>
+  <div class="hint">0 is sent when OFF, e.g. 0.0007</div>
 
-  <h3>Erweitert</h3>
-  <label>API-Pfad</label>
+  <h3>Advanced</h3>
+  <label>API path</label>
   <input name="api_path" value="{{ cfg['api_path'] }}">
   <label>Mode</label>
   <input name="mode" value="{{ cfg['mode'] }}">
 
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
-  <button type="submit">Speichern &amp; an beide Legs senden</button>
+  <button type="submit">Save &amp; send to both legs</button>
 </form>
 </body></html>"""
 
@@ -393,10 +393,10 @@ def setup():
                 cfg["jitter_on"] = parse_number(request.form["jitter_on"])
                 cfg["packetloss_on"] = parse_number(request.form["packetloss_on"])
             except (ValueError, KeyError):
-                error = "Ungültiger Zahlenwert – bitte prüfen."
+                error = "Invalid number – please check your input."
             if not error:
                 save_config(cfg)
-                log_line("Setup gespeichert – sende aktuelle Werte an beide Legs")
+                log_line("Setup saved – sending current values to both legs")
                 for leg in LEGS:
                     send_command(cfg, leg, cfg["state"][leg])
                 return redirect("/")
