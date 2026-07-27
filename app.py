@@ -496,7 +496,7 @@ INDEX_HTML = """<!doctype html>
     </div>
     <div class="host" id="hostPTP"></div>
     <div class="row">
-      <span>Port enabled</span>
+      <span>PTP GM B2</span>
       <label class="switch"><input type="checkbox" id="swPTP"
         onchange="ptpToggle(this)"><span class="slider"></span></label>
     </div>
