@@ -9,6 +9,7 @@ import base64
 import collections
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -28,8 +29,9 @@ FUNCS = ("packetloss", "jitter")
 
 DEFAULT_CONFIG = {
     "hosts": {"A": "192.168.1.10", "B": "192.168.1.11"},
-    "api_path": "/api/p_cap/instances/1/mode_command",
+    "api_path": "/api/p_cap/instances/{instance}/mode_command",
     "mode": 1,
+    "instances": {"packetloss": "1", "jitter": "1"},   # each: "0" | "1" | "both"
     "min_delay_ns": 1000000,
     "jitter_on": 0,
     "packetloss_on": 0.0007,
@@ -63,6 +65,9 @@ def load_config():
             cfg["ptp"][key] = saved.get("ptp", {}).get(key, cfg["ptp"][key])
         for key in ("bridge", "key", "light"):
             cfg["hue"][key] = saved.get("hue", {}).get(key, cfg["hue"][key])
+        for f in FUNCS:
+            val = saved.get("instances", {}).get(f, cfg["instances"][f])
+            cfg["instances"][f] = val if val in ("0", "1", "both") else "1"
     except (OSError, ValueError):
         pass
     return cfg
@@ -90,33 +95,58 @@ def log_line(text):
 
 
 # ---------------------------------------------------------------- device API
-def build_body(cfg, state):
-    jitter = cfg["jitter_on"] if state["jitter"] else 0
-    loss = cfg["packetloss_on"] if state["packetloss"] else 0
+def target_instances(cfg):
+    """All p_cap instances addressed by the current instance settings."""
+    insts = set()
+    for f in FUNCS:
+        sel = cfg["instances"][f]
+        insts |= {"0", "1"} if sel == "both" else {sel}
+    return sorted(insts)
+
+
+def build_body(cfg, state, inst):
+    """Command body for one instance: a value is only set if its function is ON
+    and configured to target this instance, otherwise 0."""
+    def active(f):
+        sel = cfg["instances"][f]
+        return state[f] and (sel == "both" or sel == inst)
+    jitter = cfg["jitter_on"] if active("jitter") else 0
+    loss = cfg["packetloss_on"] if active("packetloss") else 0
     return json.dumps([cfg["mode"], [cfg["min_delay_ns"], jitter, loss]],
                       separators=(",", ":"))
 
 
+def render_path(template, inst):
+    if "{instance}" in template:
+        return template.replace("{instance}", inst)
+    # legacy paths with a fixed instance number, e.g. /instances/1/mode_command
+    return re.sub(r"/instances/\d+/", f"/instances/{inst}/", template, count=1)
+
+
 def send_command(cfg, leg, state):
-    """PUT to the device. Returns (ok, message)."""
+    """PUT to every targeted instance of the device. Returns (ok, message)."""
     host = cfg["hosts"][leg].strip()
     if not host:
         return False, "no address configured"
-    url = host if host.startswith("http") else "http://" + host
-    url = url.rstrip("/") + cfg["api_path"]
-    body = build_body(cfg, state)
-    req = urllib.request.Request(url, data=body.encode(), method="PUT",
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-            ok = 200 <= resp.status < 300
-            msg = f"HTTP {resp.status}"
-    except urllib.error.HTTPError as e:
-        ok, msg = False, f"HTTP {e.code}"
-    except Exception as e:
-        ok, msg = False, str(e)
-    log_line(f"LEG {leg}  {body}  →  {msg}")
-    return ok, msg
+    base = host if host.startswith("http") else "http://" + host
+    ok_all, msgs = True, []
+    for inst in target_instances(cfg):
+        url = base.rstrip("/") + render_path(cfg["api_path"], inst)
+        body = build_body(cfg, state, inst)
+        req = urllib.request.Request(url, data=body.encode(), method="PUT",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+                ok = 200 <= resp.status < 300
+                msg = f"HTTP {resp.status}"
+        except urllib.error.HTTPError as e:
+            ok, msg = False, f"HTTP {e.code}"
+        except Exception as e:
+            ok, msg = False, str(e)
+        log_line(f"LEG {leg}  inst {inst}  {body}  →  {msg}")
+        ok_all = ok_all and ok
+        msgs.append(f"inst {inst}: {msg}")
+    return ok_all, "; ".join(msgs)
 
 
 # ---------------------------------------------------------------- Arista eAPI
@@ -634,7 +664,7 @@ SETUP_HTML = """<!doctype html>
   form { max-width:480px; margin:26px auto; background:#1c2027; border:1px solid #2a2f38;
          border-radius:12px; padding:24px 28px; }
   label { display:block; font-size:13px; color:#9aa0a6; margin:14px 0 4px; }
-  input { width:100%; padding:9px 12px; border-radius:8px; border:1px solid #3a404b;
+  input, select { width:100%; padding:9px 12px; border-radius:8px; border:1px solid #3a404b;
           background:#101317; color:#e8eaed; font-size:15px; font-family:Menlo,monospace; }
   .hint { font-size:12px; color:#6e747c; margin-top:3px; }
   button { margin-top:22px; width:100%; padding:11px; border:none; border-radius:8px;
@@ -665,9 +695,19 @@ SETUP_HTML = """<!doctype html>
   <label>Jitter (value when ON)</label>
   <input name="jitter_on" value="{{ cfg['jitter_on'] }}">
   <div class="hint">0 is sent when OFF</div>
+  <label>Jitter – instance</label>
+  <select name="inst_jitter">
+    {% for v in ['0', '1', 'both'] %}<option value="{{ v }}"
+      {% if cfg['instances']['jitter'] == v %}selected{% endif %}>{{ v }}</option>{% endfor %}
+  </select>
   <label>Packet loss (value when ON)</label>
   <input name="packetloss_on" value="{{ cfg['packetloss_on'] }}">
   <div class="hint">0 is sent when OFF, e.g. 0.0007</div>
+  <label>Packet loss – instance</label>
+  <select name="inst_packetloss">
+    {% for v in ['0', '1', 'both'] %}<option value="{{ v }}"
+      {% if cfg['instances']['packetloss'] == v %}selected{% endif %}>{{ v }}</option>{% endfor %}
+  </select>
 
   <h3>Main PTP – Arista switch (eAPI)</h3>
   <label>Switch – IP / host</label>
@@ -698,6 +738,7 @@ SETUP_HTML = """<!doctype html>
   <h3>Advanced</h3>
   <label>API path</label>
   <input name="api_path" value="{{ cfg['api_path'] }}">
+  <div class="hint">{instance} is replaced with the instance number</div>
   <label>Mode</label>
   <input name="mode" value="{{ cfg['mode'] }}">
 
@@ -758,6 +799,9 @@ def setup():
                 cfg["min_delay_ns"] = parse_number(request.form["min_delay_ns"])
                 cfg["jitter_on"] = parse_number(request.form["jitter_on"])
                 cfg["packetloss_on"] = parse_number(request.form["packetloss_on"])
+                for f in FUNCS:
+                    val = request.form.get("inst_" + f, "1")
+                    cfg["instances"][f] = val if val in ("0", "1", "both") else "1"
                 cfg["ptp"]["switch"] = request.form["ptp_switch"].strip()
                 cfg["ptp"]["interface"] = request.form["ptp_interface"].strip() or "Ethernet47"
                 cfg["ptp"]["username"] = request.form["ptp_username"].strip()

@@ -17,7 +17,10 @@ Then open `http://<docker-host>:9080` in your browser.
   for packet loss and jitter. ON sends the configured value, OFF sends 0 in that
   position — the other value and the min delay are left untouched.
 - **Setup:** IPs of the two legs, min. delay (ns), jitter and packet loss values
-  (used when ON), API path and mode. Saving sends the current target state to both legs.
+  (used when ON) and, per function, which p_cap instance they target (0, 1 or both);
+  plus API path and mode. Saving sends the current target state to both legs.
+  Commands go to every targeted instance, with a value set only if its function
+  is ON and targets that instance (0 otherwise).
 - **Resend values:** sends the current target state to the device again
   (e.g. after a device reboot).
 - **Main PTP:** shuts the PTP grandmaster port on an Arista switch down / up
