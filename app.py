@@ -451,6 +451,8 @@ INDEX_HTML = """<!doctype html>
   input:disabled + .slider { opacity:.4; cursor:wait; }
   #ptpcard input:checked + .slider, #powercard input:checked + .slider { background:#2e9e4f; }
   .dot.warn { background:#e0a100; box-shadow:0 0 6px #e0a100; }
+  .note { font-size:12px; color:#9aa0a6; margin-top:12px; line-height:1.45;
+          border-top:1px solid #2a2f38; padding-top:10px; }
   .resend { margin-top:14px; width:100%; background:#2a2f38; color:#c8ccd2; border:none;
             border-radius:8px; padding:8px; font-size:13px; cursor:pointer; }
   .resend:hover { background:#343a45; }
@@ -510,6 +512,8 @@ INDEX_HTML = """<!doctype html>
       <label class="switch"><input type="checkbox" id="swHUE"
         onchange="hueToggle(this)"><span class="slider"></span></label>
     </div>
+    <div class="note">&#9432; Allow ~10 min warm-up after switching on.<br>
+      Please switch off again when finished (heat &amp; power consumption).</div>
   </div>
 </main>
 <div id="log"></div>
