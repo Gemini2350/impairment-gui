@@ -20,6 +20,11 @@ Then open `http://<docker-host>:9080` in your browser.
   (used when ON), API path and mode. Saving sends the current target state to both legs.
 - **Resend values:** sends the current target state to the device again
   (e.g. after a device reboot).
+- **Main PTP:** shuts the PTP grandmaster port on an Arista switch down / up
+  via eAPI, with live admin/link status.
+- **Power:** switches a Philips Hue smart plug on/off via the local bridge API.
+  Pairing (press the bridge link button, then click *Pair with bridge*) and a
+  plug/light list are built into the setup page.
 
 The configuration including switch state is persisted in `./data/config.json`.
 

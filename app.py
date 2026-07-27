@@ -35,12 +35,14 @@ DEFAULT_CONFIG = {
     "packetloss_on": 0.0007,
     "state": {leg: {f: False for f in FUNCS} for leg in LEGS},
     "ptp": {"switch": "", "interface": "Ethernet47", "username": "", "password": ""},
+    "hue": {"bridge": "", "key": "", "light": ""},
 }
 
 app = Flask(__name__)
 lock = threading.Lock()
 online = {leg: None for leg in LEGS}   # None = unknown
 ptp_status = {"configured": False, "reachable": None, "port_up": None, "link": ""}
+hue_status = {"configured": False, "reachable": None, "on": None, "name": "", "msg": ""}
 log = collections.deque(maxlen=20)
 
 
@@ -59,6 +61,8 @@ def load_config():
                 cfg["state"][leg][f] = bool(saved.get("state", {}).get(leg, {}).get(f, False))
         for key in ("switch", "interface", "username", "password"):
             cfg["ptp"][key] = saved.get("ptp", {}).get(key, cfg["ptp"][key])
+        for key in ("bridge", "key", "light"):
+            cfg["hue"][key] = saved.get("hue", {}).get(key, cfg["hue"][key])
     except (OSError, ValueError):
         pass
     return cfg
@@ -176,6 +180,56 @@ def ptp_poller():
         time.sleep(PING_INTERVAL)
 
 
+# ---------------------------------------------------------------- Philips Hue
+def hue_request(bridge, path, method="GET", payload=None):
+    """HTTP call against the Hue bridge (v1 API). Returns (ok, parsed_json_or_msg)."""
+    bridge = bridge.strip()
+    if not bridge:
+        return False, "no bridge configured"
+    base = bridge if bridge.startswith("http") else "http://" + bridge
+    url = base.rstrip("/") + "/api" + path
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE   # newer bridges use a self-signed cert on https
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT, context=ctx) as resp:
+            return True, json.load(resp)
+    except Exception as e:
+        return False, str(e)
+
+
+def hue_refresh(cfg):
+    """Read the real on/off state of the plug from the bridge."""
+    h = cfg["hue"]
+    if not (h["bridge"].strip() and h["key"].strip() and str(h["light"]).strip()):
+        hue_status.update({"configured": False, "reachable": None, "on": None,
+                           "name": "", "msg": ""})
+        return
+    ok, res = hue_request(h["bridge"], f"/{h['key']}/lights/{h['light']}")
+    if ok and isinstance(res, dict) and "state" in res:
+        hue_status.update({"configured": True, "reachable": True,
+                           "on": bool(res["state"].get("on")),
+                           "name": res.get("name", ""), "msg": ""})
+        return
+    if ok and isinstance(res, list) and res and "error" in res[0]:
+        msg = res[0]["error"].get("description", "bridge error")
+    else:
+        msg = str(res) if not ok else "unexpected reply"
+    hue_status.update({"configured": True, "reachable": False, "on": None,
+                       "name": "", "msg": msg})
+
+
+def hue_poller():
+    while True:
+        try:
+            hue_refresh(load_config())
+        except Exception:
+            pass
+        time.sleep(PING_INTERVAL)
+
+
 # ---------------------------------------------------------------- ping thread
 def ping_host(host):
     h = host.strip()
@@ -209,8 +263,12 @@ def api_status():
     ptp = dict(ptp_status)
     ptp["switch"] = cfg["ptp"]["switch"]
     ptp["interface"] = cfg["ptp"]["interface"]
+    hue = dict(hue_status)
+    hue["bridge"] = cfg["hue"]["bridge"]
+    hue["light"] = cfg["hue"]["light"]
     return jsonify({"online": online, "hosts": cfg["hosts"],
-                    "state": cfg["state"], "ptp": ptp, "log": list(log)})
+                    "state": cfg["state"], "ptp": ptp, "hue": hue,
+                    "log": list(log)})
 
 
 @app.post("/api/toggle")
@@ -261,6 +319,66 @@ def api_ptp():
         return jsonify({"ok": ok, "msg": msg, "ptp": ptp_status})
 
 
+@app.post("/api/hue")
+def api_hue():
+    """Switch the Hue plug on/off."""
+    on = bool(request.get_json(force=True).get("on"))
+    with lock:
+        cfg = load_config()
+        h = cfg["hue"]
+        ok, res = hue_request(h["bridge"], f"/{h['key']}/lights/{h['light']}/state",
+                              "PUT", {"on": on})
+        if ok and isinstance(res, list) and any("error" in r for r in res):
+            ok = False
+            res = "; ".join(r["error"].get("description", "error")
+                            for r in res if "error" in r)
+        msg = "OK" if ok else str(res)
+        log_line(f"HUE  plug {h['light']} {'on' if on else 'off'}  →  {msg}")
+        if ok:
+            hue_refresh(cfg)
+        return jsonify({"ok": ok, "msg": msg, "hue": hue_status})
+
+
+@app.post("/api/hue/pair")
+def api_hue_pair():
+    """Create an application key (user must press the bridge link button first)."""
+    bridge = (request.get_json(force=True).get("bridge") or "").strip()
+    with lock:
+        cfg = load_config()
+        if bridge:
+            cfg["hue"]["bridge"] = bridge
+        ok, res = hue_request(cfg["hue"]["bridge"], "", "POST",
+                              {"devicetype": "impairment-gui#docker"})
+        if ok and isinstance(res, list) and res and "success" in res[0]:
+            cfg["hue"]["key"] = res[0]["success"]["username"]
+            save_config(cfg)
+            log_line("HUE  paired with bridge, application key saved")
+            return jsonify({"ok": True, "key": cfg["hue"]["key"]})
+        if ok and isinstance(res, list) and res and "error" in res[0]:
+            msg = res[0]["error"].get("description", "pairing failed")
+        else:
+            msg = str(res)
+        return jsonify({"ok": False, "msg": msg})
+
+
+@app.post("/api/hue/lights")
+def api_hue_lights():
+    """List plugs/lights known to the bridge (id → name), for the setup page."""
+    data = request.get_json(force=True)
+    cfg = load_config()
+    bridge = (data.get("bridge") or "").strip() or cfg["hue"]["bridge"]
+    key = (data.get("key") or "").strip() or cfg["hue"]["key"]
+    ok, res = hue_request(bridge, f"/{key}/lights")
+    if ok and isinstance(res, dict):
+        return jsonify({"ok": True, "lights": {i: v.get("name", "?")
+                                               for i, v in sorted(res.items())}})
+    if ok and isinstance(res, list) and res and "error" in res[0]:
+        msg = res[0]["error"].get("description", "failed")
+    else:
+        msg = str(res)
+    return jsonify({"ok": False, "msg": msg, "lights": {}})
+
+
 # ---------------------------------------------------------------- pages
 INDEX_HTML = """<!doctype html>
 <html lang="en"><head>
@@ -301,7 +419,7 @@ INDEX_HTML = """<!doctype html>
   input:checked + .slider { background:#e0a100; }
   input:checked + .slider:before { transform:translateX(24px); }
   input:disabled + .slider { opacity:.4; cursor:wait; }
-  #ptpcard input:checked + .slider { background:#2e9e4f; }
+  #ptpcard input:checked + .slider, #powercard input:checked + .slider { background:#2e9e4f; }
   .dot.warn { background:#e0a100; box-shadow:0 0 6px #e0a100; }
   .resend { margin-top:14px; width:100%; background:#2a2f38; color:#c8ccd2; border:none;
             border-radius:8px; padding:8px; font-size:13px; cursor:pointer; }
@@ -351,6 +469,18 @@ INDEX_HTML = """<!doctype html>
         onchange="ptpToggle(this)"><span class="slider"></span></label>
     </div>
   </div>
+  <div class="card" id="powercard">
+    <div class="leghead">
+      <h2>Power</h2>
+      <span class="pingstate"><span class="dot" id="dotHUE"></span><span id="pingHUE">–</span></span>
+    </div>
+    <div class="host" id="hostHUE"></div>
+    <div class="row">
+      <span>Power on</span>
+      <label class="switch"><input type="checkbox" id="swHUE"
+        onchange="hueToggle(this)"><span class="slider"></span></label>
+    </div>
+  </div>
 </main>
 <div id="log"></div>
 <div id="toast"></div>
@@ -372,7 +502,44 @@ function apply(s) {
     }
   }
   applyPtp(s.ptp);
+  applyHue(s.hue);
   document.getElementById("log").textContent = s.log.join("\\n") || "No commands sent yet.";
+}
+
+function applyHue(h) {
+  const dot = document.getElementById("dotHUE");
+  const txt = document.getElementById("pingHUE");
+  const sw = document.getElementById("swHUE");
+  document.getElementById("hostHUE").textContent = h.configured
+    ? (h.name ? h.name + " – " : "") + "plug " + h.light + " @ " + h.bridge
+    : "not configured – see Setup";
+  let cls = "", label = "–";
+  if (!h.configured)              { label = "–"; }
+  else if (h.reachable === false) { cls = "off";  label = h.msg || "bridge unreachable"; }
+  else if (h.on === true)         { cls = "on";   label = "on"; }
+  else if (h.on === false)        { cls = "warn"; label = "off"; }
+  else                            { label = "checking…"; }
+  dot.className = "dot " + cls;
+  txt.textContent = label;
+  if (!busy) sw.checked = h.on === true;
+  sw.disabled = busy || !h.configured || h.reachable === false;
+}
+
+async function hueToggle(el) {
+  const want = el.checked;
+  if (!want && !confirm("Cut power via the Hue plug?")) {
+    el.checked = true;
+    return;
+  }
+  busy = true; el.disabled = true;
+  try {
+    const r = await (await fetch("/api/hue", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({on: want})})).json();
+    if (!r.ok) { el.checked = !want; toast("Power: " + r.msg); }
+  } catch (e) { el.checked = !want; toast("Server unreachable"); }
+  busy = false; el.disabled = false;
+  refresh();
 }
 
 function applyPtp(p) {
@@ -473,6 +640,9 @@ SETUP_HTML = """<!doctype html>
   button { margin-top:22px; width:100%; padding:11px; border:none; border-radius:8px;
            background:#2e6bd6; color:#fff; font-size:15px; cursor:pointer; }
   button:hover { background:#3a78e6; }
+  .mini { width:auto; margin-top:12px; background:#2a2f38; color:#c8ccd2;
+          font-size:13px; padding:8px 12px; }
+  .mini:hover { background:#343a45; }
   .err { color:#ffb4ab; margin-top:12px; font-size:14px; }
   h3 { margin:22px 0 0; font-size:14px; color:#c8ccd2; border-top:1px solid #2a2f38; padding-top:18px; }
 </style></head>
@@ -510,6 +680,21 @@ SETUP_HTML = """<!doctype html>
   <label>eAPI password</label>
   <input name="ptp_password" type="password" placeholder="(unchanged)">
 
+  <h3>Power switch – Philips Hue</h3>
+  <label>Bridge – IP / host</label>
+  <input name="hue_bridge" value="{{ cfg['hue']['bridge'] }}">
+  <div class="hint">leave empty to disable the card</div>
+  <label>Application key</label>
+  <input name="hue_key" value="{{ cfg['hue']['key'] }}">
+  <div class="hint">no key yet? press the link button on the bridge, then click Pair below</div>
+  <label>Plug / light ID</label>
+  <input name="hue_light" value="{{ cfg['hue']['light'] }}">
+  <div style="display:flex;gap:10px">
+    <button type="button" class="mini" onclick="huePair()">Pair with bridge</button>
+    <button type="button" class="mini" onclick="hueLights()">List plugs &amp; lights</button>
+  </div>
+  <div class="hint" id="hueinfo"></div>
+
   <h3>Advanced</h3>
   <label>API path</label>
   <input name="api_path" value="{{ cfg['api_path'] }}">
@@ -519,6 +704,38 @@ SETUP_HTML = """<!doctype html>
   {% if error %}<div class="err">{{ error }}</div>{% endif %}
   <button type="submit">Save &amp; send to both legs</button>
 </form>
+<script>
+async function huePair() {
+  const bridge = document.querySelector('[name=hue_bridge]').value;
+  const el = document.getElementById('hueinfo');
+  el.textContent = 'Pairing…';
+  try {
+    const r = await (await fetch('/api/hue/pair', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({bridge})})).json();
+    if (r.ok) {
+      document.querySelector('[name=hue_key]').value = r.key;
+      el.textContent = 'Paired – key filled in. Now pick the plug ID and save.';
+    } else {
+      el.textContent = 'Pairing failed: ' + r.msg;
+    }
+  } catch (e) { el.textContent = 'Server unreachable'; }
+}
+async function hueLights() {
+  const bridge = document.querySelector('[name=hue_bridge]').value;
+  const key = document.querySelector('[name=hue_key]').value;
+  const el = document.getElementById('hueinfo');
+  el.textContent = 'Loading…';
+  try {
+    const r = await (await fetch('/api/hue/lights', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({bridge, key})})).json();
+    el.textContent = r.ok
+      ? (Object.entries(r.lights).map(([i, n]) => i + ': ' + n).join('   |   ') || 'nothing found')
+      : 'Failed: ' + r.msg;
+  } catch (e) { el.textContent = 'Server unreachable'; }
+}
+</script>
 </body></html>"""
 
 
@@ -546,6 +763,9 @@ def setup():
                 cfg["ptp"]["username"] = request.form["ptp_username"].strip()
                 if request.form.get("ptp_password"):
                     cfg["ptp"]["password"] = request.form["ptp_password"]
+                cfg["hue"]["bridge"] = request.form["hue_bridge"].strip()
+                cfg["hue"]["key"] = request.form["hue_key"].strip()
+                cfg["hue"]["light"] = request.form["hue_light"].strip()
             except (ValueError, KeyError):
                 error = "Invalid number – please check your input."
             if not error:
@@ -562,4 +782,5 @@ if __name__ == "__main__":
         save_config(load_config())
     threading.Thread(target=pinger, daemon=True).start()
     threading.Thread(target=ptp_poller, daemon=True).start()
+    threading.Thread(target=hue_poller, daemon=True).start()
     app.run(host="0.0.0.0", port=8080, threaded=True)
