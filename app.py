@@ -33,7 +33,7 @@ DEFAULT_CONFIG = {
     "api_path": "/api/p_cap/instances/{instance}/mode_command",
     "mode": 1,
     "instances": {"packetloss": "1", "jitter": "1"},   # each: "0" | "1" | "both"
-    "polling": False,   # periodic status queries (ping / eAPI / Hue)
+    "polling": True,   # periodic status queries (ping / eAPI / Hue)
     "min_delay_ns": 1000000,
     "jitter_on": 0,
     "packetloss_on": 0.0007,
@@ -78,7 +78,7 @@ def load_config():
         for f in FUNCS:
             val = saved.get("instances", {}).get(f, cfg["instances"][f])
             cfg["instances"][f] = val if val in ("0", "1", "both") else "1"
-        cfg["polling"] = bool(saved.get("polling", False))
+        cfg["polling"] = bool(saved.get("polling", True))
     except (OSError, ValueError):
         pass
     return cfg
@@ -703,10 +703,6 @@ function applyHue(h) {
 
 async function hueToggle(el) {
   const want = el.checked;
-  if (!want && !confirm("Cut power via the Hue plug?")) {
-    el.checked = true;
-    return;
-  }
   busy = true; el.disabled = true;
   try {
     const r = await (await fetch("/api/hue", {method:"POST",
@@ -760,10 +756,6 @@ async function portToggle(key, el) {
   const want = el.checked;
   const iface = lastPtp && lastPtp.ports && lastPtp.ports[key]
     ? lastPtp.ports[key].interface : "this port";
-  if (!want && !confirm("Shut down " + iface + " on the switch?")) {
-    el.checked = true;
-    return;
-  }
   busy = true; el.disabled = true;
   try {
     const r = await (await fetch("/api/ptp", {method:"POST",
