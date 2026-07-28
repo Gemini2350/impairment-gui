@@ -33,6 +33,7 @@ DEFAULT_CONFIG = {
     "api_path": "/api/p_cap/instances/{instance}/mode_command",
     "mode": 1,
     "instances": {"packetloss": "1", "jitter": "1"},   # each: "0" | "1" | "both"
+    "polling": False,   # periodic status queries (ping / eAPI / Hue)
     "min_delay_ns": 1000000,
     "jitter_on": 0,
     "packetloss_on": 0.0007,
@@ -77,6 +78,7 @@ def load_config():
         for f in FUNCS:
             val = saved.get("instances", {}).get(f, cfg["instances"][f])
             cfg["instances"][f] = val if val in ("0", "1", "both") else "1"
+        cfg["polling"] = bool(saved.get("polling", False))
     except (OSError, ValueError):
         pass
     return cfg
@@ -265,10 +267,30 @@ def ptp_refresh(cfg):
                        "gm": query_gm(cfg)})
 
 
+def ptp_idle(cfg):
+    """Keep the port structure in sync with the config without querying the
+    switch (polling disabled). Leaves data from a manual refresh untouched."""
+    ifaces = {k: v.strip() for k, v in cfg["ptp"]["interfaces"].items() if v.strip()}
+    if not cfg["ptp"]["switch"].strip() or not ifaces:
+        ptp_status.update({"configured": False, "reachable": None,
+                           "ports": {}, "gm": None})
+        return
+    current = {k: p.get("interface") for k, p in ptp_status["ports"].items()}
+    if ptp_status["configured"] and current == ifaces:
+        return
+    ptp_status.update({"configured": True, "reachable": None, "gm": None,
+                       "ports": {k: {"interface": v, "up": None, "link": ""}
+                                 for k, v in ifaces.items()}})
+
+
 def ptp_poller():
     while True:
         try:
-            ptp_refresh(load_config())
+            cfg = load_config()
+            if cfg["polling"]:
+                ptp_refresh(cfg)
+            else:
+                ptp_idle(cfg)
         except Exception:
             pass
         time.sleep(PING_INTERVAL)
@@ -315,10 +337,27 @@ def hue_refresh(cfg):
                        "name": "", "msg": msg})
 
 
+def hue_idle(cfg):
+    """Track configured-state without querying the bridge (polling disabled)."""
+    h = cfg["hue"]
+    configured = bool(h["bridge"].strip() and h["key"].strip()
+                      and str(h["light"]).strip())
+    if not configured:
+        hue_status.update({"configured": False, "reachable": None, "on": None,
+                           "name": "", "msg": ""})
+    elif not hue_status["configured"]:
+        hue_status.update({"configured": True, "reachable": None, "on": None,
+                           "name": "", "msg": ""})
+
+
 def hue_poller():
     while True:
         try:
-            hue_refresh(load_config())
+            cfg = load_config()
+            if cfg["polling"]:
+                hue_refresh(cfg)
+            else:
+                hue_idle(cfg)
         except Exception:
             pass
         time.sleep(PING_INTERVAL)
@@ -345,8 +384,9 @@ def ping_host(host):
 def pinger():
     while True:
         cfg = load_config()
-        for leg in LEGS:
-            online[leg] = ping_host(cfg["hosts"][leg])
+        if cfg["polling"]:
+            for leg in LEGS:
+                online[leg] = ping_host(cfg["hosts"][leg])
         time.sleep(PING_INTERVAL)
 
 
@@ -361,7 +401,18 @@ def api_status():
     hue["light"] = cfg["hue"]["light"]
     return jsonify({"online": online, "hosts": cfg["hosts"],
                     "state": cfg["state"], "ptp": ptp, "hue": hue,
-                    "log": list(log)})
+                    "polling": cfg["polling"], "log": list(log)})
+
+
+@app.post("/api/refresh")
+def api_refresh():
+    """One-shot status query of everything (used when polling is disabled)."""
+    cfg = load_config()
+    for leg in LEGS:
+        online[leg] = ping_host(cfg["hosts"][leg])
+    ptp_refresh(cfg)
+    hue_refresh(cfg)
+    return jsonify({"ok": True})
 
 
 @app.post("/api/toggle")
@@ -537,7 +588,10 @@ INDEX_HTML = """<!doctype html>
 <body>
 <header>
   <h1>Impairment Control</h1>
-  <a href="/setup">&#9881;&#65039; Setup</a>
+  <span style="display:flex;gap:18px">
+    <a href="#" id="refreshlink" onclick="refreshStatus();return false">&#8635; Refresh status</a>
+    <a href="/setup">&#9881;&#65039; Setup</a>
+  </span>
 </header>
 <main>
   {% for leg in legs %}
@@ -606,14 +660,17 @@ INDEX_HTML = """<!doctype html>
 <script>
 const LEGS = ["A","B"];
 let busy = false;
+let pollingOn = false;
 
 function apply(s) {
+  pollingOn = s.polling;
   for (const leg of LEGS) {
     const dot = document.getElementById("dot"+leg);
     const ping = document.getElementById("ping"+leg);
     const on = s.online[leg];
     dot.className = "dot " + (on === true ? "on" : on === false ? "off" : "");
-    ping.textContent = on === true ? "online" : on === false ? "offline" : "checking…";
+    ping.textContent = on === true ? "online" : on === false ? "offline"
+                       : pollingOn ? "checking…" : "–";
     document.getElementById("host"+leg).textContent = s.hosts[leg];
     if (!busy) {
       document.getElementById("sw"+leg+"packetloss").checked = s.state[leg].packetloss;
@@ -637,7 +694,7 @@ function applyHue(h) {
   else if (h.reachable === false) { cls = "off";  label = h.msg || "bridge unreachable"; }
   else if (h.on === true)         { cls = "on";   label = "on"; }
   else if (h.on === false)        { cls = "warn"; label = "off"; }
-  else                            { label = "checking…"; }
+  else                            { label = pollingOn ? "checking…" : "–"; }
   dot.className = "dot " + cls;
   txt.textContent = label;
   if (!busy) sw.checked = h.on === true;
@@ -681,7 +738,7 @@ function applyPtp(p) {
   if (!p.configured)              { label = "–"; }
   else if (p.reachable === false) { cls = "off"; label = "switch unreachable"; }
   else if (p.reachable === true)  { cls = "on";  label = "connected"; }
-  else                            { label = "checking…"; }
+  else                            { label = pollingOn ? "checking…" : "–"; }
   dot.className = "dot " + cls;
   txt.textContent = label;
   for (const [key, [rowId, swId, stId, nameId]] of Object.entries(PORTMAP)) {
@@ -695,7 +752,7 @@ function applyPtp(p) {
       : port.up === false ? "admin down" : "–";
     const sw = document.getElementById(swId);
     if (!busy) sw.checked = port.up === true;
-    sw.disabled = busy || p.reachable !== true;
+    sw.disabled = busy || p.reachable === false;
   }
 }
 
@@ -720,6 +777,14 @@ async function portToggle(key, el) {
 
 async function refresh() {
   try { apply(await (await fetch("/api/status")).json()); } catch (e) {}
+}
+
+async function refreshStatus() {
+  const a = document.getElementById("refreshlink");
+  a.textContent = "↻ refreshing…";
+  try { await fetch("/api/refresh", {method:"POST"}); } catch (e) {}
+  await refresh();
+  a.textContent = "↻ Refresh status";
 }
 
 function toast(msg) {
@@ -853,6 +918,14 @@ SETUP_HTML = """<!doctype html>
   </div>
   <div class="hint" id="hueinfo"></div>
 
+  <h3>Status polling</h3>
+  <label style="display:flex;align-items:center;gap:10px;color:#e8eaed;font-size:14px">
+    <input type="checkbox" name="polling" style="width:auto"
+      {% if cfg['polling'] %}checked{% endif %}>
+    Periodic status queries (ping, switch, Hue) every 3&nbsp;s
+  </label>
+  <div class="hint">off: state is only queried after an action or via &#8220;Refresh status&#8221;</div>
+
   <h3>Advanced</h3>
   <label>API path</label>
   <input name="api_path" value="{{ cfg['api_path'] }}">
@@ -929,6 +1002,7 @@ def setup():
                 cfg["hue"]["bridge"] = request.form["hue_bridge"].strip()
                 cfg["hue"]["key"] = request.form["hue_key"].strip()
                 cfg["hue"]["light"] = request.form["hue_light"].strip()
+                cfg["polling"] = "polling" in request.form
             except (ValueError, KeyError):
                 error = "Invalid number – please check your input."
             if not error:
