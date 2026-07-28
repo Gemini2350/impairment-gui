@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
 app = Flask(__name__)
 lock = threading.Lock()
 online = {leg: None for leg in LEGS}   # None = unknown
-ptp_status = {"configured": False, "reachable": None, "ports": {}}
+ptp_status = {"configured": False, "reachable": None, "ports": {}, "gm": None}
 hue_status = {"configured": False, "reachable": None, "on": None, "name": "", "msg": ""}
 log = collections.deque(maxlen=20)
 
@@ -159,7 +159,7 @@ def send_command(cfg, leg, state):
 
 
 # ---------------------------------------------------------------- Arista eAPI
-def eapi_call(cfg, cmds):
+def eapi_call(cfg, cmds, fmt="json"):
     """JSON-RPC runCmds against the Arista switch. Returns (ok, result_or_message)."""
     p = cfg["ptp"]
     host = p["switch"].strip()
@@ -168,7 +168,7 @@ def eapi_call(cfg, cmds):
     url = host if host.startswith("http") else "https://" + host
     url = url.rstrip("/") + "/command-api"
     payload = {"jsonrpc": "2.0", "method": "runCmds", "id": "1",
-               "params": {"version": 1, "cmds": cmds, "format": "json"}}
+               "params": {"version": 1, "cmds": cmds, "format": fmt}}
     auth = base64.b64encode(f"{p['username']}:{p['password']}".encode()).decode()
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
                                  headers={"Content-Type": "application/json",
@@ -188,15 +188,64 @@ def eapi_call(cfg, cmds):
     return True, data.get("result", [])
 
 
+GM_ID_RE = re.compile(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){7}")
+gm_strategy = {"idx": 0}   # remembers which GM query variant works on this EOS
+
+
+def find_gm_identity(obj):
+    """Recursively search eAPI json output for a grandmaster clock identity."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = k.lower()
+            if ("grandmaster" in kl or kl.startswith("gm")) and isinstance(v, str):
+                m = GM_ID_RE.search(v)
+                if m:
+                    return m.group(0)
+            r = find_gm_identity(v)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for item in obj:
+            r = find_gm_identity(item)
+            if r:
+                return r
+    return None
+
+
+def query_gm(cfg):
+    """Current PTP grandmaster identity, or None. Tries json first, then the
+    text output of 'show ptp' / 'show ptp masters' (EOS versions differ)."""
+    strategies = (("json", "show ptp"),
+                  ("text", "show ptp"),
+                  ("text", "show ptp masters"))
+    start = gm_strategy["idx"]
+    for i in [start] + [j for j in range(len(strategies)) if j != start]:
+        fmt, cmd = strategies[i]
+        ok, res = eapi_call(cfg, [cmd], fmt=fmt)
+        if not ok:
+            continue
+        if fmt == "json":
+            gm = find_gm_identity(res)
+        else:
+            out = res[0].get("output", "") if isinstance(res, list) and res else ""
+            m = re.search(r"[Gg]randmaster[^\n]*?(" + GM_ID_RE.pattern + ")", out)
+            gm = m.group(1) if m else None
+        if gm:
+            gm_strategy["idx"] = i
+            return gm
+    return None
+
+
 def ptp_refresh(cfg):
     """Read the real admin/link state of all configured switch ports (one call)."""
     ifaces = {k: v.strip() for k, v in cfg["ptp"]["interfaces"].items() if v.strip()}
     if not cfg["ptp"]["switch"].strip() or not ifaces:
-        ptp_status.update({"configured": False, "reachable": None, "ports": {}})
+        ptp_status.update({"configured": False, "reachable": None,
+                           "ports": {}, "gm": None})
         return
     ok, res = eapi_call(cfg, [f"show interfaces {','.join(ifaces.values())} status"])
     if not ok:
-        ptp_status.update({"configured": True, "reachable": False,
+        ptp_status.update({"configured": True, "reachable": False, "gm": None,
                            "ports": {k: {"interface": v, "up": None, "link": str(res)}
                                      for k, v in ifaces.items()}})
         return
@@ -212,7 +261,8 @@ def ptp_refresh(cfg):
         else:
             link = st.get("linkStatus", "unknown")
             ports[k] = {"interface": v, "up": link != "disabled", "link": link}
-    ptp_status.update({"configured": True, "reachable": True, "ports": ports})
+    ptp_status.update({"configured": True, "reachable": True, "ports": ports,
+                       "gm": query_gm(cfg)})
 
 
 def ptp_poller():
@@ -522,6 +572,7 @@ INDEX_HTML = """<!doctype html>
       <span class="pingstate"><span class="dot" id="dotPTP"></span><span id="pingPTP">–</span></span>
     </div>
     <div class="host" id="hostPTP"></div>
+    <div class="host" id="gmPTP" style="margin-top:-12px"></div>
     <div class="row" id="rowgmB2" style="display:none">
       <span>PTP GM B2</span>
       <span class="rowright"><span class="rowstate" id="stgmB2"></span>
@@ -624,6 +675,8 @@ function applyPtp(p) {
   const txt = document.getElementById("pingPTP");
   document.getElementById("hostPTP").textContent =
     p.configured ? p.switch : "not configured – see Setup";
+  document.getElementById("gmPTP").textContent =
+    p.configured ? "Current GM: " + (p.gm || "–") : "";
   let cls = "", label = "–";
   if (!p.configured)              { label = "–"; }
   else if (p.reachable === false) { cls = "off"; label = "switch unreachable"; }
