@@ -26,6 +26,7 @@ PING_INTERVAL = 3          # seconds between ping rounds
 HTTP_TIMEOUT = 5           # timeout for the PUT to the device
 LEGS = ("A", "B")
 FUNCS = ("packetloss", "jitter")
+PORT_KEYS = ("gmB2", "gmB3", "legA", "legB")   # switch ports controlled via eAPI
 
 DEFAULT_CONFIG = {
     "hosts": {"A": "192.168.1.10", "B": "192.168.1.11"},
@@ -36,14 +37,16 @@ DEFAULT_CONFIG = {
     "jitter_on": 0,
     "packetloss_on": 0.0007,
     "state": {leg: {f: False for f in FUNCS} for leg in LEGS},
-    "ptp": {"switch": "", "interface": "Ethernet47", "username": "", "password": ""},
+    "ptp": {"switch": "", "username": "", "password": "",
+            "interfaces": {"gmB2": "Ethernet47", "gmB3": "Ethernet48",
+                           "legA": "Ethernet49/1", "legB": "Ethernet50/1"}},
     "hue": {"bridge": "", "key": "", "light": ""},
 }
 
 app = Flask(__name__)
 lock = threading.Lock()
 online = {leg: None for leg in LEGS}   # None = unknown
-ptp_status = {"configured": False, "reachable": None, "port_up": None, "link": ""}
+ptp_status = {"configured": False, "reachable": None, "ports": {}}
 hue_status = {"configured": False, "reachable": None, "on": None, "name": "", "msg": ""}
 log = collections.deque(maxlen=20)
 
@@ -61,8 +64,14 @@ def load_config():
             cfg["hosts"][leg] = saved.get("hosts", {}).get(leg, cfg["hosts"][leg])
             for f in FUNCS:
                 cfg["state"][leg][f] = bool(saved.get("state", {}).get(leg, {}).get(f, False))
-        for key in ("switch", "interface", "username", "password"):
-            cfg["ptp"][key] = saved.get("ptp", {}).get(key, cfg["ptp"][key])
+        saved_ptp = saved.get("ptp", {})
+        for key in ("switch", "username", "password"):
+            cfg["ptp"][key] = saved_ptp.get(key, cfg["ptp"][key])
+        saved_if = saved_ptp.get("interfaces", {})
+        if not saved_if and saved_ptp.get("interface"):
+            saved_if = {"gmB2": saved_ptp["interface"]}   # legacy single-port config
+        for k in PORT_KEYS:
+            cfg["ptp"]["interfaces"][k] = saved_if.get(k, cfg["ptp"]["interfaces"][k])
         for key in ("bridge", "key", "light"):
             cfg["hue"][key] = saved.get("hue", {}).get(key, cfg["hue"][key])
         for f in FUNCS:
@@ -180,25 +189,30 @@ def eapi_call(cfg, cmds):
 
 
 def ptp_refresh(cfg):
-    """Read the real admin/link state of the PTP port from the switch."""
-    intf = cfg["ptp"]["interface"].strip()
-    if not cfg["ptp"]["switch"].strip() or not intf:
-        ptp_status.update({"configured": False, "reachable": None,
-                           "port_up": None, "link": ""})
+    """Read the real admin/link state of all configured switch ports (one call)."""
+    ifaces = {k: v.strip() for k, v in cfg["ptp"]["interfaces"].items() if v.strip()}
+    if not cfg["ptp"]["switch"].strip() or not ifaces:
+        ptp_status.update({"configured": False, "reachable": None, "ports": {}})
         return
-    ok, res = eapi_call(cfg, [f"show interfaces {intf} status"])
+    ok, res = eapi_call(cfg, [f"show interfaces {','.join(ifaces.values())} status"])
     if not ok:
         ptp_status.update({"configured": True, "reachable": False,
-                           "port_up": None, "link": str(res)})
+                           "ports": {k: {"interface": v, "up": None, "link": str(res)}
+                                     for k, v in ifaces.items()}})
         return
     try:
-        link = res[0]["interfaceStatuses"][intf].get("linkStatus", "unknown")
+        statuses = res[0]["interfaceStatuses"]
     except (KeyError, IndexError, TypeError):
-        ptp_status.update({"configured": True, "reachable": True,
-                           "port_up": None, "link": "unexpected reply"})
-        return
-    ptp_status.update({"configured": True, "reachable": True,
-                       "port_up": link != "disabled", "link": link})
+        statuses = {}
+    ports = {}
+    for k, v in ifaces.items():
+        st = statuses.get(v)
+        if st is None:
+            ports[k] = {"interface": v, "up": None, "link": "not found"}
+        else:
+            link = st.get("linkStatus", "unknown")
+            ports[k] = {"interface": v, "up": link != "disabled", "link": link}
+    ptp_status.update({"configured": True, "reachable": True, "ports": ports})
 
 
 def ptp_poller():
@@ -292,7 +306,6 @@ def api_status():
     cfg = load_config()
     ptp = dict(ptp_status)
     ptp["switch"] = cfg["ptp"]["switch"]
-    ptp["interface"] = cfg["ptp"]["interface"]
     hue = dict(hue_status)
     hue["bridge"] = cfg["hue"]["bridge"]
     hue["light"] = cfg["hue"]["light"]
@@ -333,17 +346,22 @@ def api_resend():
 
 @app.post("/api/ptp")
 def api_ptp():
-    """Enable/disable the PTP port on the Arista switch (no shutdown / shutdown)."""
+    """Enable/disable one switch port (no shutdown / shutdown)."""
     data = request.get_json(force=True)
+    port = data.get("port")
     on = bool(data.get("on"))
+    if port not in PORT_KEYS:
+        return jsonify({"ok": False, "msg": "invalid request"}), 400
     with lock:
         cfg = load_config()
-        intf = cfg["ptp"]["interface"].strip()
+        intf = cfg["ptp"]["interfaces"].get(port, "").strip()
+        if not intf:
+            return jsonify({"ok": False, "msg": "no interface configured"})
         cmd = "no shutdown" if on else "shutdown"
         ok, res = eapi_call(cfg, ["enable", "configure",
                                   f"interface {intf}", cmd])
         msg = "OK" if ok else str(res)
-        log_line(f"PTP  {intf} {cmd}  →  {msg}")
+        log_line(f"SWITCH  {intf} {cmd}  →  {msg}")
         if ok:
             ptp_refresh(cfg)
         return jsonify({"ok": ok, "msg": msg, "ptp": ptp_status})
@@ -449,8 +467,11 @@ INDEX_HTML = """<!doctype html>
   input:checked + .slider { background:#e0a100; }
   input:checked + .slider:before { transform:translateX(24px); }
   input:disabled + .slider { opacity:.4; cursor:wait; }
-  #ptpcard input:checked + .slider, #powercard input:checked + .slider { background:#2e9e4f; }
+  #ptpcard input:checked + .slider, #powercard input:checked + .slider,
+  .portsw:checked + .slider { background:#2e9e4f; }
   .dot.warn { background:#e0a100; box-shadow:0 0 6px #e0a100; }
+  .rowright { display:flex; align-items:center; gap:8px; }
+  .rowstate { font-size:11px; color:#9aa0a6; }
   .note { font-size:12px; color:#9aa0a6; margin-top:12px; line-height:1.45;
           border-top:1px solid #2a2f38; padding-top:10px; }
   .resend { margin-top:14px; width:100%; background:#2a2f38; color:#c8ccd2; border:none;
@@ -486,6 +507,12 @@ INDEX_HTML = """<!doctype html>
       <label class="switch"><input type="checkbox" id="sw{{ leg }}jitter"
         onchange="toggle('{{ leg }}','jitter',this)"><span class="slider"></span></label>
     </div>
+    <div class="row" id="rowport{{ leg }}" style="display:none">
+      <span id="portname{{ leg }}">Switch port</span>
+      <span class="rowright"><span class="rowstate" id="portstate{{ leg }}"></span>
+      <label class="switch"><input type="checkbox" class="portsw" id="swport{{ leg }}"
+        onchange="portToggle('leg{{ leg }}', this)"><span class="slider"></span></label></span>
+    </div>
     <button class="resend" onclick="resend('{{ leg }}')">Resend values</button>
   </div>
   {% endfor %}
@@ -495,10 +522,17 @@ INDEX_HTML = """<!doctype html>
       <span class="pingstate"><span class="dot" id="dotPTP"></span><span id="pingPTP">–</span></span>
     </div>
     <div class="host" id="hostPTP"></div>
-    <div class="row">
+    <div class="row" id="rowgmB2" style="display:none">
       <span>PTP GM B2</span>
-      <label class="switch"><input type="checkbox" id="swPTP"
-        onchange="ptpToggle(this)"><span class="slider"></span></label>
+      <span class="rowright"><span class="rowstate" id="stgmB2"></span>
+      <label class="switch"><input type="checkbox" id="swgmB2"
+        onchange="portToggle('gmB2', this)"><span class="slider"></span></label></span>
+    </div>
+    <div class="row" id="rowgmB3" style="display:none">
+      <span>PTP GM B3</span>
+      <span class="rowright"><span class="rowstate" id="stgmB3"></span>
+      <label class="switch"><input type="checkbox" id="swgmB3"
+        onchange="portToggle('gmB3', this)"><span class="slider"></span></label></span>
     </div>
   </div>
   <div class="card" id="powercard">
@@ -576,27 +610,47 @@ async function hueToggle(el) {
   refresh();
 }
 
+let lastPtp = null;
+const PORTMAP = {
+  gmB2: ["rowgmB2", "swgmB2", "stgmB2", null],
+  gmB3: ["rowgmB3", "swgmB3", "stgmB3", null],
+  legA: ["rowportA", "swportA", "portstateA", "portnameA"],
+  legB: ["rowportB", "swportB", "portstateB", "portnameB"],
+};
+
 function applyPtp(p) {
+  lastPtp = p;
   const dot = document.getElementById("dotPTP");
   const txt = document.getElementById("pingPTP");
-  const sw = document.getElementById("swPTP");
   document.getElementById("hostPTP").textContent =
-    p.configured ? p.interface + " @ " + p.switch : "not configured – see Setup";
+    p.configured ? p.switch : "not configured – see Setup";
   let cls = "", label = "–";
   if (!p.configured)              { label = "–"; }
-  else if (p.reachable === false) { cls = "off";  label = "switch unreachable"; }
-  else if (p.port_up === true)    { cls = "on";   label = p.link === "connected" ? "up" : p.link; }
-  else if (p.port_up === false)   { cls = "warn"; label = "admin down"; }
+  else if (p.reachable === false) { cls = "off"; label = "switch unreachable"; }
+  else if (p.reachable === true)  { cls = "on";  label = "connected"; }
   else                            { label = "checking…"; }
   dot.className = "dot " + cls;
   txt.textContent = label;
-  if (!busy) sw.checked = p.port_up === true;
-  sw.disabled = busy || !p.configured || p.reachable === false;
+  for (const [key, [rowId, swId, stId, nameId]] of Object.entries(PORTMAP)) {
+    const row = document.getElementById(rowId);
+    const port = p.ports ? p.ports[key] : null;
+    if (!port) { row.style.display = "none"; continue; }
+    row.style.display = "";
+    if (nameId) document.getElementById(nameId).textContent = port.interface;
+    document.getElementById(stId).textContent =
+      port.up === true ? (port.link === "connected" ? "up" : port.link)
+      : port.up === false ? "admin down" : "–";
+    const sw = document.getElementById(swId);
+    if (!busy) sw.checked = port.up === true;
+    sw.disabled = busy || p.reachable !== true;
+  }
 }
 
-async function ptpToggle(el) {
+async function portToggle(key, el) {
   const want = el.checked;
-  if (!want && !confirm("Shut down the Main PTP port on the switch?")) {
+  const iface = lastPtp && lastPtp.ports && lastPtp.ports[key]
+    ? lastPtp.ports[key].interface : "this port";
+  if (!want && !confirm("Shut down " + iface + " on the switch?")) {
     el.checked = true;
     return;
   }
@@ -604,8 +658,8 @@ async function ptpToggle(el) {
   try {
     const r = await (await fetch("/api/ptp", {method:"POST",
       headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({on: want})})).json();
-    if (!r.ok) { el.checked = !want; toast("Main PTP: " + r.msg); }
+      body: JSON.stringify({port: key, on: want})})).json();
+    if (!r.ok) { el.checked = !want; toast(iface + ": " + r.msg); }
   } catch (e) { el.checked = !want; toast("Server unreachable"); }
   busy = false; el.disabled = false;
   refresh();
@@ -717,8 +771,15 @@ SETUP_HTML = """<!doctype html>
   <label>Switch – IP / host</label>
   <input name="ptp_switch" value="{{ cfg['ptp']['switch'] }}">
   <div class="hint">HTTPS with self-signed certificate accepted; leave empty to disable the card</div>
-  <label>Interface</label>
-  <input name="ptp_interface" value="{{ cfg['ptp']['interface'] }}">
+  <label>Interface – PTP GM B2</label>
+  <input name="ptp_if_gmB2" value="{{ cfg['ptp']['interfaces']['gmB2'] }}">
+  <label>Interface – PTP GM B3</label>
+  <input name="ptp_if_gmB3" value="{{ cfg['ptp']['interfaces']['gmB3'] }}">
+  <label>Interface – LEG A port</label>
+  <input name="ptp_if_legA" value="{{ cfg['ptp']['interfaces']['legA'] }}">
+  <label>Interface – LEG B port</label>
+  <input name="ptp_if_legB" value="{{ cfg['ptp']['interfaces']['legB'] }}">
+  <div class="hint">leave an interface empty to hide its switch in the UI</div>
   <label>eAPI username</label>
   <input name="ptp_username" value="{{ cfg['ptp']['username'] }}">
   <label>eAPI password</label>
@@ -807,7 +868,8 @@ def setup():
                     val = request.form.get("inst_" + f, "1")
                     cfg["instances"][f] = val if val in ("0", "1", "both") else "1"
                 cfg["ptp"]["switch"] = request.form["ptp_switch"].strip()
-                cfg["ptp"]["interface"] = request.form["ptp_interface"].strip() or "Ethernet47"
+                for k in PORT_KEYS:
+                    cfg["ptp"]["interfaces"][k] = request.form.get("ptp_if_" + k, "").strip()
                 cfg["ptp"]["username"] = request.form["ptp_username"].strip()
                 if request.form.get("ptp_password"):
                     cfg["ptp"]["password"] = request.form["ptp_password"]
