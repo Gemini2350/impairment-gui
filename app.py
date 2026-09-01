@@ -40,7 +40,8 @@ DEFAULT_CONFIG = {
     "state": {leg: {f: False for f in FUNCS} for leg in LEGS},
     "ptp": {"switch": "", "username": "", "password": "",
             "interfaces": {"gmB2": "Ethernet47", "gmB3": "Ethernet48",
-                           "legA": "Ethernet49/1", "legB": "Ethernet50/1"}},
+                           "legA": "Ethernet49/1", "legB": "Ethernet50/1"},
+            "labels": {"gmB2": "PTP GM B2", "gmB3": "PTP GM B3"}},
     "hue": {"bridge": "", "key": "", "light": ""},
 }
 
@@ -73,6 +74,11 @@ def load_config():
             saved_if = {"gmB2": saved_ptp["interface"]}   # legacy single-port config
         for k in PORT_KEYS:
             cfg["ptp"]["interfaces"][k] = saved_if.get(k, cfg["ptp"]["interfaces"][k])
+        saved_lbl = saved_ptp.get("labels", {})
+        for k in ("gmB2", "gmB3"):
+            val = str(saved_lbl.get(k, "")).strip()
+            if val:
+                cfg["ptp"]["labels"][k] = val
         for key in ("bridge", "key", "light"):
             cfg["hue"][key] = saved.get("hue", {}).get(key, cfg["hue"][key])
         for f in FUNCS:
@@ -396,6 +402,7 @@ def api_status():
     cfg = load_config()
     ptp = dict(ptp_status)
     ptp["switch"] = cfg["ptp"]["switch"]
+    ptp["labels"] = cfg["ptp"]["labels"]
     hue = dict(hue_status)
     hue["bridge"] = cfg["hue"]["bridge"]
     hue["light"] = cfg["hue"]["light"]
@@ -628,13 +635,13 @@ INDEX_HTML = """<!doctype html>
     <div class="host" id="hostPTP"></div>
     <div class="host" id="gmPTP" style="margin-top:-12px"></div>
     <div class="row" id="rowgmB2" style="display:none">
-      <span>PTP GM B2</span>
+      <span id="lblgmB2">PTP GM B2</span>
       <span class="rowright"><span class="rowstate" id="stgmB2"></span>
       <label class="switch"><input type="checkbox" id="swgmB2"
         onchange="portToggle('gmB2', this)"><span class="slider"></span></label></span>
     </div>
     <div class="row" id="rowgmB3" style="display:none">
-      <span>PTP GM B3</span>
+      <span id="lblgmB3">PTP GM B3</span>
       <span class="rowright"><span class="rowstate" id="stgmB3"></span>
       <label class="switch"><input type="checkbox" id="swgmB3"
         onchange="portToggle('gmB3', this)"><span class="slider"></span></label></span>
@@ -730,6 +737,10 @@ function applyPtp(p) {
     p.configured ? p.switch : "not configured – see Setup";
   document.getElementById("gmPTP").textContent =
     p.configured ? "Current GM: " + (p.gm || "–") : "";
+  if (p.labels) {
+    document.getElementById("lblgmB2").textContent = p.labels.gmB2;
+    document.getElementById("lblgmB3").textContent = p.labels.gmB3;
+  }
   let cls = "", label = "–";
   if (!p.configured)              { label = "–"; }
   else if (p.reachable === false) { cls = "off"; label = "switch unreachable"; }
@@ -881,9 +892,13 @@ SETUP_HTML = """<!doctype html>
   <label>Switch – IP / host</label>
   <input name="ptp_switch" value="{{ cfg['ptp']['switch'] }}">
   <div class="hint">HTTPS with self-signed certificate accepted; leave empty to disable the card</div>
-  <label>Interface – PTP GM B2</label>
+  <label>PTP toggle 1 – label</label>
+  <input name="ptp_lbl_gmB2" value="{{ cfg['ptp']['labels']['gmB2'] }}">
+  <label>PTP toggle 1 – interface</label>
   <input name="ptp_if_gmB2" value="{{ cfg['ptp']['interfaces']['gmB2'] }}">
-  <label>Interface – PTP GM B3</label>
+  <label>PTP toggle 2 – label</label>
+  <input name="ptp_lbl_gmB3" value="{{ cfg['ptp']['labels']['gmB3'] }}">
+  <label>PTP toggle 2 – interface</label>
   <input name="ptp_if_gmB3" value="{{ cfg['ptp']['interfaces']['gmB3'] }}">
   <label>Interface – LEG A port</label>
   <input name="ptp_if_legA" value="{{ cfg['ptp']['interfaces']['legA'] }}">
@@ -988,6 +1003,9 @@ def setup():
                 cfg["ptp"]["switch"] = request.form["ptp_switch"].strip()
                 for k in PORT_KEYS:
                     cfg["ptp"]["interfaces"][k] = request.form.get("ptp_if_" + k, "").strip()
+                for k in ("gmB2", "gmB3"):
+                    cfg["ptp"]["labels"][k] = (request.form.get("ptp_lbl_" + k, "").strip()
+                                               or DEFAULT_CONFIG["ptp"]["labels"][k])
                 cfg["ptp"]["username"] = request.form["ptp_username"].strip()
                 if request.form.get("ptp_password"):
                     cfg["ptp"]["password"] = request.form["ptp_password"]
