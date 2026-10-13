@@ -35,8 +35,9 @@ DEFAULT_CONFIG = {
     "instances": {"jitter": "1"},   # "0" | "1" | "both"
     "polling": True,   # periodic status queries (ping / eAPI / Hue)
     "min_delay_ns": 1000000,
-    "jitter_on": 0,
     "packetloss_kpps": 109,   # storm-control multicast pps limit, in kpps (1 stream ≈ 109)
+    "jitter_vlan": 666,                 # the leg's switch port moves here while jitter is on
+    "native_vlans": {"A": 1, "B": 2},   # and back to these when jitter is off
     "state": {leg: {f: False for f in FUNCS} for leg in LEGS},
     "ptp": {"switch": "", "username": "", "password": "",
             "interfaces": {"gmB2": "Ethernet47", "gmB3": "Ethernet48",
@@ -59,9 +60,13 @@ def load_config():
     try:
         with open(CONFIG_FILE) as f:
             saved = json.load(f)
-        for key in ("api_path", "mode", "min_delay_ns", "jitter_on", "packetloss_kpps"):
+        for key in ("api_path", "mode", "min_delay_ns", "packetloss_kpps", "jitter_vlan"):
             if key in saved:
                 cfg[key] = saved[key]
+        for leg in LEGS:
+            v = saved.get("native_vlans", {}).get(leg)
+            if v is not None:
+                cfg["native_vlans"][leg] = v
         for leg in LEGS:
             cfg["hosts"][leg] = saved.get("hosts", {}).get(leg, cfg["hosts"][leg])
             for f in FUNCS:
@@ -118,11 +123,9 @@ def target_instances(cfg):
 
 
 def build_body(cfg, state, inst):
-    """Command body for one instance. Packet loss is done via storm-control on
-    the switch, so the loss position is always 0 here."""
-    sel = cfg["instances"]["jitter"]
-    jitter = cfg["jitter_on"] if state["jitter"] and (sel == "both" or sel == inst) else 0
-    return json.dumps([cfg["mode"], [cfg["min_delay_ns"], jitter, 0]],
+    """Command body for one instance. Packet loss is done via storm-control and
+    jitter via VLAN switching, so only the min delay is ever non-zero here."""
+    return json.dumps([cfg["mode"], [cfg["min_delay_ns"], 0, 0]],
                       separators=(",", ":"))
 
 
@@ -284,7 +287,8 @@ def ptp_refresh(cfg):
             ports[k] = {"interface": v, "up": None, "link": "not found"}
         else:
             link = st.get("linkStatus", "unknown")
-            ports[k] = {"interface": v, "up": link != "disabled", "link": link}
+            ports[k] = {"interface": v, "up": link != "disabled", "link": link,
+                        "vlan": st.get("vlanInformation", {}).get("vlanId")}
     ptp_status.update({"configured": True, "reachable": True, "ports": ports,
                        "gm": query_gm(cfg)})
 
@@ -419,6 +423,7 @@ def api_status():
     ptp = dict(ptp_status)
     ptp["switch"] = cfg["ptp"]["switch"]
     ptp["labels"] = cfg["ptp"]["labels"]
+    ptp["jitter_vlan"] = cfg["jitter_vlan"]
     hue = dict(hue_status)
     hue["bridge"] = cfg["hue"]["bridge"]
     hue["light"] = cfg["hue"]["light"]
@@ -495,6 +500,35 @@ def api_ptp():
         if ok:
             ptp_refresh(cfg)
         return jsonify({"ok": ok, "msg": msg, "ptp": ptp_status})
+
+
+@app.post("/api/jitter")
+def api_jitter():
+    """Global jitter via VLAN switching: move the selected leg's switch port
+    into the jitter VLAN, the other one (and 'off': both) back to normal."""
+    target = request.get_json(force=True).get("target")
+    if target not in ("off", "A", "B"):
+        return jsonify({"ok": False, "msg": "invalid request"}), 400
+    with lock:
+        cfg = load_config()
+        if_a = cfg["ptp"]["interfaces"]["legA"].strip()
+        if_b = cfg["ptp"]["interfaces"]["legB"].strip()
+        if not (cfg["ptp"]["switch"].strip() and if_a and if_b):
+            return jsonify({"ok": False,
+                            "msg": "switch or leg interfaces not configured"})
+        vlan_a = cfg["jitter_vlan"] if target == "A" else cfg["native_vlans"]["A"]
+        vlan_b = cfg["jitter_vlan"] if target == "B" else cfg["native_vlans"]["B"]
+        ok, res = eapi_call(cfg, ["enable", "configure",
+                                  f"interface {if_a}",
+                                  f"switchport access vlan {vlan_a}",
+                                  f"interface {if_b}",
+                                  f"switchport access vlan {vlan_b}"])
+        msg = "OK" if ok else str(res)
+        log_line(f"SWITCH  jitter {target}: {if_a} → vlan {vlan_a}, "
+                 f"{if_b} → vlan {vlan_b}  →  {msg}")
+        if ok:
+            ptp_refresh(cfg)
+        return jsonify({"ok": ok, "msg": msg})
 
 
 @app.post("/api/hue")
@@ -602,6 +636,12 @@ INDEX_HTML = """<!doctype html>
   .dot.warn { background:#e0a100; box-shadow:0 0 6px #e0a100; }
   .rowright { display:flex; align-items:center; gap:8px; }
   .rowstate { font-size:11px; color:#9aa0a6; }
+  .seg { display:flex; gap:8px; margin-top:4px; }
+  .seg button { flex:1; padding:9px 0; border:none; border-radius:8px;
+                background:#2a2f38; color:#c8ccd2; font-size:14px; cursor:pointer; }
+  .seg button:hover { background:#343a45; }
+  .seg button.active { background:#e0a100; color:#14171c; font-weight:600; }
+  .seg button:disabled { opacity:.4; cursor:default; }
   .note { font-size:12px; color:#9aa0a6; margin-top:12px; line-height:1.45;
           border-top:1px solid #2a2f38; padding-top:10px; }
   .resend { margin-top:14px; width:100%; background:#2a2f38; color:#c8ccd2; border:none;
@@ -635,11 +675,6 @@ INDEX_HTML = """<!doctype html>
       <label class="switch"><input type="checkbox" id="sw{{ leg }}packetloss"
         onchange="toggle('{{ leg }}','packetloss',this)"><span class="slider"></span></label>
     </div>
-    <div class="row">
-      <span>Jitter</span>
-      <label class="switch"><input type="checkbox" id="sw{{ leg }}jitter"
-        onchange="toggle('{{ leg }}','jitter',this)"><span class="slider"></span></label>
-    </div>
     <div class="row" id="rowport{{ leg }}" style="display:none">
       <span id="portname{{ leg }}">Switch port</span>
       <span class="rowright"><span class="rowstate" id="portstate{{ leg }}"></span>
@@ -649,6 +684,18 @@ INDEX_HTML = """<!doctype html>
     <button class="resend" onclick="resend('{{ leg }}')">Resend values</button>
   </div>
   {% endfor %}
+  <div class="card" id="jittercard">
+    <div class="leghead">
+      <h2>Jitter</h2>
+      <span class="pingstate"><span id="jitterstate">–</span></span>
+    </div>
+    <div class="host" id="jittervlans"></div>
+    <div class="seg">
+      <button id="jbtnoff" onclick="setJitter('off')">Off</button>
+      <button id="jbtnA" onclick="setJitter('A')">LEG A</button>
+      <button id="jbtnB" onclick="setJitter('B')">LEG B</button>
+    </div>
+  </div>
   <div class="card" id="ptpcard">
     <div class="leghead">
       <h2>Main PTP</h2>
@@ -703,7 +750,6 @@ function apply(s) {
     document.getElementById("host"+leg).textContent = s.hosts[leg];
     if (!busy) {
       document.getElementById("sw"+leg+"packetloss").checked = s.state[leg].packetloss;
-      document.getElementById("sw"+leg+"jitter").checked = s.state[leg].jitter;
     }
   }
   applyPtp(s.ptp);
@@ -783,6 +829,40 @@ function applyPtp(p) {
     if (!busy) sw.checked = port.up === true;
     sw.disabled = busy || p.reachable === false;
   }
+  applyJitter(p);
+}
+
+function applyJitter(p) {
+  const pa = p.ports && p.ports.legA, pb = p.ports && p.ports.legB;
+  const va = pa ? pa.vlan : null, vb = pb ? pb.vlan : null;
+  document.getElementById("jittervlans").textContent = (pa && pb)
+    ? pa.interface + ": VLAN " + (va ?? "?") + "   ·   " +
+      pb.interface + ": VLAN " + (vb ?? "?")
+    : "leg interfaces not configured – see Setup";
+  let active = null;
+  if (va === p.jitter_vlan)      active = "A";
+  else if (vb === p.jitter_vlan) active = "B";
+  else if (va != null || vb != null) active = "off";
+  for (const t of ["off", "A", "B"]) {
+    const b = document.getElementById("jbtn" + t);
+    b.className = active === t ? "active" : "";
+    b.disabled = busy || p.reachable === false || !(pa && pb);
+  }
+  document.getElementById("jitterstate").textContent =
+    active === "A" ? "LEG A" : active === "B" ? "LEG B"
+    : active === "off" ? "off" : "–";
+}
+
+async function setJitter(target) {
+  busy = true;
+  try {
+    const r = await (await fetch("/api/jitter", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({target})})).json();
+    if (!r.ok) toast("Jitter: " + r.msg);
+  } catch (e) { toast("Server unreachable"); }
+  busy = false;
+  refresh();
 }
 
 async function portToggle(key, el) {
@@ -893,10 +973,7 @@ SETUP_HTML = """<!doctype html>
   <label>Min. delay (ns)</label>
   <input name="min_delay_ns" value="{{ cfg['min_delay_ns'] }}">
   <div class="hint">always sent, e.g. 1'000'000</div>
-  <label>Jitter (value when ON)</label>
-  <input name="jitter_on" value="{{ cfg['jitter_on'] }}">
-  <div class="hint">0 is sent when OFF</div>
-  <label>Jitter – instance</label>
+  <label>Min delay – instance</label>
   <select name="inst_jitter">
     {% for v in ['0', '1', 'both'] %}<option value="{{ v }}"
       {% if cfg['instances']['jitter'] == v %}selected{% endif %}>{{ v }}</option>{% endfor %}
@@ -905,6 +982,13 @@ SETUP_HTML = """<!doctype html>
   <input name="packetloss_kpps" value="{{ cfg['packetloss_kpps'] }}">
   <div class="hint">multicast pps limit on the leg's switch port when ON
     (1 stream &#8776; 109 kpps); OFF removes the limit</div>
+  <label>Jitter – VLAN</label>
+  <input name="jitter_vlan" value="{{ cfg['jitter_vlan'] }}">
+  <div class="hint">the selected leg's switch port moves to this VLAN while jitter is on</div>
+  <label>LEG A – normal VLAN</label>
+  <input name="native_vlan_A" value="{{ cfg['native_vlans']['A'] }}">
+  <label>LEG B – normal VLAN</label>
+  <input name="native_vlan_B" value="{{ cfg['native_vlans']['B'] }}">
 
   <h3>Main PTP – Arista switch (eAPI)</h3>
   <label>Switch – IP / host</label>
@@ -1013,8 +1097,10 @@ def setup():
                 cfg["api_path"] = request.form["api_path"].strip() or DEFAULT_CONFIG["api_path"]
                 cfg["mode"] = parse_number(request.form["mode"])
                 cfg["min_delay_ns"] = parse_number(request.form["min_delay_ns"])
-                cfg["jitter_on"] = parse_number(request.form["jitter_on"])
                 cfg["packetloss_kpps"] = parse_number(request.form["packetloss_kpps"])
+                cfg["jitter_vlan"] = parse_number(request.form["jitter_vlan"])
+                cfg["native_vlans"]["A"] = parse_number(request.form["native_vlan_A"])
+                cfg["native_vlans"]["B"] = parse_number(request.form["native_vlan_B"])
                 val = request.form.get("inst_jitter", "1")
                 cfg["instances"]["jitter"] = val if val in ("0", "1", "both") else "1"
                 cfg["ptp"]["switch"] = request.form["ptp_switch"].strip()
