@@ -1,9 +1,12 @@
 # Impairment Control GUI
 
-Web GUI to toggle **packet loss** and **jitter** on two devices (LEG A / LEG B)
-via `PUT /api/p_cap/instances/1/mode_command`.
+Web GUI to impair two ST 2110 legs (LEG A / LEG B) for failover testing:
+packet loss via Arista storm-control, jitter via a single p_cap impairment
+device that legs are routed through by VLAN switching, plus PTP GM port
+shutdowns and a Hue power plug.
 
-Body format: `[mode, [min_delay_ns, jitter, packetloss]]` — e.g. `[1,[1000000,0,0.0007]]`
+Device command: `PUT /api/p_cap/instances/{instance}/mode_command` with body
+`[mode, [min_delay_ns, jitter, packetloss]]` — e.g. `[1,[1000000,200000,0]]`
 
 ## Run with Docker
 
@@ -13,21 +16,18 @@ docker compose up -d --build
 
 Then open `http://<docker-host>:9080` in your browser.
 
-- **Main page:** ping status of both legs (online/offline) plus a packet loss
-  switch per leg and one global jitter selector. Packet loss is done on the
-  Arista switch: ON sets `storm-control multicast level pps <kpps*1000>` on the
-  leg's switch port, OFF removes the limit (1 stream ≈ 109 kpps). Jitter is a
-  global Off / LEG A / LEG B choice: the selected leg's switch port moves into
-  the jitter VLAN (default 666), the other one goes back to its normal VLAN
-  (defaults: LEG A → 1, LEG B → 2); the active state is read back from the
-  switch. The p_cap mode_command now only carries the min delay.
-- **Setup:** IPs of the two legs, min. delay (ns), jitter and packet loss values
-  (used when ON) and, per function, which p_cap instance they target (0, 1 or both);
-  plus API path and mode. Saving sends the current target state to both legs.
-  Commands go to every targeted instance, with a value set only if its function
-  is ON and targets that instance (0 otherwise).
-- **Resend values:** sends the current target state to the device again
-  (e.g. after a device reboot).
+- **Packet loss (per leg):** ON sets `storm-control multicast level pps
+  <kpps*1000>` on the leg's switch port, OFF removes the limit
+  (1 stream ≈ 109 kpps; value configured in setup).
+- **Jitter (global):** Off / LEG A / LEG B. The selected leg's switch port
+  moves into the jitter VLAN (default 666) where the single p_cap device sits,
+  the other one goes back to its normal VLAN (defaults: LEG A → 1, LEG B → 2).
+  The active state and per-port VLANs are read back from the switch. The device
+  itself gets `[mode,[min_delay, jitter, 0]]` on the configured instance(s);
+  its ping status, address and a *Resend values* button live on the jitter card.
+- **Setup:** device address, min delay, jitter value, p_cap instance, packet
+  loss kpps, jitter/normal VLANs, Arista switch + port interfaces and labels,
+  Hue bridge. Saving re-sends the device values and the storm-control state.
 - **Main PTP:** shuts the PTP grandmaster port on an Arista switch down / up
   via eAPI, with live admin/link status.
 - **Power:** switches a Philips Hue smart plug on/off via the local bridge API.

@@ -29,12 +29,13 @@ FUNCS = ("packetloss", "jitter")
 PORT_KEYS = ("gmB2", "gmB3", "legA", "legB")   # switch ports controlled via eAPI
 
 DEFAULT_CONFIG = {
-    "hosts": {"A": "192.168.1.10", "B": "192.168.1.11"},
+    "host": "192.168.1.10",   # the single p_cap device (jitter box in the jitter VLAN)
     "api_path": "/api/p_cap/instances/{instance}/mode_command",
     "mode": 1,
     "instances": {"jitter": "1"},   # "0" | "1" | "both"
     "polling": True,   # periodic status queries (ping / eAPI / Hue)
     "min_delay_ns": 1000000,
+    "jitter_on": 0,           # jitter value sent to the device (which leg: VLAN selector)
     "packetloss_kpps": 109,   # storm-control multicast pps limit, in kpps (1 stream ≈ 109)
     "jitter_vlan": 666,                 # the leg's switch port moves here while jitter is on
     "native_vlans": {"A": 1, "B": 2},   # and back to these when jitter is off
@@ -48,7 +49,7 @@ DEFAULT_CONFIG = {
 
 app = Flask(__name__)
 lock = threading.Lock()
-online = {leg: None for leg in LEGS}   # None = unknown
+device_online = {"up": None}   # None = unknown
 ptp_status = {"configured": False, "reachable": None, "ports": {}, "gm": None}
 hue_status = {"configured": False, "reachable": None, "on": None, "name": "", "msg": ""}
 log = collections.deque(maxlen=20)
@@ -60,15 +61,19 @@ def load_config():
     try:
         with open(CONFIG_FILE) as f:
             saved = json.load(f)
-        for key in ("api_path", "mode", "min_delay_ns", "packetloss_kpps", "jitter_vlan"):
+        for key in ("api_path", "mode", "min_delay_ns", "jitter_on",
+                    "packetloss_kpps", "jitter_vlan"):
             if key in saved:
                 cfg[key] = saved[key]
+        if "host" in saved:
+            cfg["host"] = saved["host"]
+        elif saved.get("hosts", {}).get("A"):
+            cfg["host"] = saved["hosts"]["A"]   # legacy two-device config
         for leg in LEGS:
             v = saved.get("native_vlans", {}).get(leg)
             if v is not None:
                 cfg["native_vlans"][leg] = v
         for leg in LEGS:
-            cfg["hosts"][leg] = saved.get("hosts", {}).get(leg, cfg["hosts"][leg])
             for f in FUNCS:
                 cfg["state"][leg][f] = bool(saved.get("state", {}).get(leg, {}).get(f, False))
         saved_ptp = saved.get("ptp", {})
@@ -122,10 +127,11 @@ def target_instances(cfg):
     return ["0", "1"] if sel == "both" else [sel]
 
 
-def build_body(cfg, state, inst):
-    """Command body for one instance. Packet loss is done via storm-control and
-    jitter via VLAN switching, so only the min delay is ever non-zero here."""
-    return json.dumps([cfg["mode"], [cfg["min_delay_ns"], 0, 0]],
+def build_body(cfg, inst):
+    """Command body for one instance of the jitter device. Packet loss is done
+    via storm-control on the switch, so the loss position is always 0; which
+    leg the jitter affects is chosen via the VLAN selector."""
+    return json.dumps([cfg["mode"], [cfg["min_delay_ns"], cfg["jitter_on"], 0]],
                       separators=(",", ":"))
 
 
@@ -136,16 +142,16 @@ def render_path(template, inst):
     return re.sub(r"/instances/\d+/", f"/instances/{inst}/", template, count=1)
 
 
-def send_command(cfg, leg, state):
-    """PUT to every targeted instance of the device. Returns (ok, message)."""
-    host = cfg["hosts"][leg].strip()
+def send_command(cfg):
+    """PUT to every targeted instance of the jitter device. Returns (ok, message)."""
+    host = cfg["host"].strip()
     if not host:
-        return False, "no address configured"
+        return False, "no device address configured"
     base = host if host.startswith("http") else "http://" + host
     ok_all, msgs = True, []
     for inst in target_instances(cfg):
         url = base.rstrip("/") + render_path(cfg["api_path"], inst)
-        body = build_body(cfg, state, inst)
+        body = build_body(cfg, inst)
         req = urllib.request.Request(url, data=body.encode(), method="PUT",
                                      headers={"Content-Type": "application/json"})
         try:
@@ -156,7 +162,7 @@ def send_command(cfg, leg, state):
             ok, msg = False, f"HTTP {e.code}"
         except Exception as e:
             ok, msg = False, str(e)
-        log_line(f"LEG {leg}  inst {inst}  {body}  →  {msg}")
+        log_line(f"DEVICE  inst {inst}  {body}  →  {msg}")
         ok_all = ok_all and ok
         msgs.append(f"inst {inst}: {msg}")
     return ok_all, "; ".join(msgs)
@@ -411,8 +417,7 @@ def pinger():
     while True:
         cfg = load_config()
         if cfg["polling"]:
-            for leg in LEGS:
-                online[leg] = ping_host(cfg["hosts"][leg])
+            device_online["up"] = ping_host(cfg["host"])
         time.sleep(PING_INTERVAL)
 
 
@@ -427,7 +432,7 @@ def api_status():
     hue = dict(hue_status)
     hue["bridge"] = cfg["hue"]["bridge"]
     hue["light"] = cfg["hue"]["light"]
-    return jsonify({"online": online, "hosts": cfg["hosts"],
+    return jsonify({"device_online": device_online["up"], "host": cfg["host"],
                     "state": cfg["state"], "ptp": ptp, "hue": hue,
                     "polling": cfg["polling"], "log": list(log)})
 
@@ -436,8 +441,7 @@ def api_status():
 def api_refresh():
     """One-shot status query of everything (used when polling is disabled)."""
     cfg = load_config()
-    for leg in LEGS:
-        online[leg] = ping_host(cfg["hosts"][leg])
+    device_online["up"] = ping_host(cfg["host"])
     ptp_refresh(cfg)
     hue_refresh(cfg)
     return jsonify({"ok": True})
@@ -446,17 +450,14 @@ def api_refresh():
 @app.post("/api/toggle")
 def api_toggle():
     data = request.get_json(force=True)
-    leg, func = data.get("leg"), data.get("func")
-    if leg not in LEGS or func not in FUNCS:
+    leg = data.get("leg")
+    if leg not in LEGS or data.get("func") != "packetloss":
         return jsonify({"ok": False, "msg": "invalid request"}), 400
     with lock:
         cfg = load_config()
         new_state = dict(cfg["state"][leg])
-        new_state[func] = not new_state[func]
-        if func == "packetloss":
-            ok, msg = send_storm_control(cfg, leg, new_state["packetloss"])
-        else:
-            ok, msg = send_command(cfg, leg, new_state)
+        new_state["packetloss"] = not new_state["packetloss"]
+        ok, msg = send_storm_control(cfg, leg, new_state["packetloss"])
         if ok:
             cfg["state"][leg] = new_state
             save_config(cfg)
@@ -465,17 +466,14 @@ def api_toggle():
 
 @app.post("/api/resend")
 def api_resend():
-    """Re-send the current target state to the device (e.g. after a device reboot)."""
-    data = request.get_json(force=True)
-    leg = data.get("leg")
-    if leg not in LEGS:
-        return jsonify({"ok": False, "msg": "invalid request"}), 400
+    """Re-send device values and re-apply storm-control (e.g. after reboots)."""
     with lock:
         cfg = load_config()
-        ok, msg = send_command(cfg, leg, cfg["state"][leg])
-        if storm_control_configured(cfg, leg):
-            ok2, msg2 = send_storm_control(cfg, leg, cfg["state"][leg]["packetloss"])
-            ok, msg = ok and ok2, f"{msg}; storm-control: {msg2}"
+        ok, msg = send_command(cfg)
+        for leg in LEGS:
+            if storm_control_configured(cfg, leg):
+                ok2, _ = send_storm_control(cfg, leg, cfg["state"][leg]["packetloss"])
+                ok = ok and ok2
         return jsonify({"ok": ok, "msg": msg, "state": cfg["state"]})
 
 
@@ -667,9 +665,7 @@ INDEX_HTML = """<!doctype html>
   <div class="card">
     <div class="leghead">
       <h2>LEG {{ leg }}</h2>
-      <span class="pingstate"><span class="dot" id="dot{{ leg }}"></span><span id="ping{{ leg }}">–</span></span>
     </div>
-    <div class="host" id="host{{ leg }}"></div>
     <div class="row">
       <span>Packet loss</span>
       <label class="switch"><input type="checkbox" id="sw{{ leg }}packetloss"
@@ -681,20 +677,21 @@ INDEX_HTML = """<!doctype html>
       <label class="switch"><input type="checkbox" class="portsw" id="swport{{ leg }}"
         onchange="portToggle('leg{{ leg }}', this)"><span class="slider"></span></label></span>
     </div>
-    <button class="resend" onclick="resend('{{ leg }}')">Resend values</button>
   </div>
   {% endfor %}
   <div class="card" id="jittercard">
     <div class="leghead">
       <h2>Jitter</h2>
-      <span class="pingstate"><span id="jitterstate">–</span></span>
+      <span class="pingstate"><span class="dot" id="dotDEV"></span><span id="pingDEV">–</span></span>
     </div>
-    <div class="host" id="jittervlans"></div>
+    <div class="host" id="hostDEV"></div>
+    <div class="host" id="jittervlans" style="margin-top:-12px"></div>
     <div class="seg">
       <button id="jbtnoff" onclick="setJitter('off')">Off</button>
       <button id="jbtnA" onclick="setJitter('A')">LEG A</button>
       <button id="jbtnB" onclick="setJitter('B')">LEG B</button>
     </div>
+    <button class="resend" onclick="resendDev()">Resend values</button>
   </div>
   <div class="card" id="ptpcard">
     <div class="leghead">
@@ -741,17 +738,17 @@ let pollingOn = false;
 function apply(s) {
   pollingOn = s.polling;
   for (const leg of LEGS) {
-    const dot = document.getElementById("dot"+leg);
-    const ping = document.getElementById("ping"+leg);
-    const on = s.online[leg];
-    dot.className = "dot " + (on === true ? "on" : on === false ? "off" : "");
-    ping.textContent = on === true ? "online" : on === false ? "offline"
-                       : pollingOn ? "checking…" : "–";
-    document.getElementById("host"+leg).textContent = s.hosts[leg];
     if (!busy) {
       document.getElementById("sw"+leg+"packetloss").checked = s.state[leg].packetloss;
     }
   }
+  const don = s.device_online;
+  document.getElementById("dotDEV").className =
+    "dot " + (don === true ? "on" : don === false ? "off" : "");
+  document.getElementById("pingDEV").textContent =
+    don === true ? "online" : don === false ? "offline"
+    : pollingOn ? "checking…" : "–";
+  document.getElementById("hostDEV").textContent = s.host;
   applyPtp(s.ptp);
   applyHue(s.hue);
   document.getElementById("log").textContent = s.log.join("\\n") || "No commands sent yet.";
@@ -848,9 +845,6 @@ function applyJitter(p) {
     b.className = active === t ? "active" : "";
     b.disabled = busy || p.reachable === false || !(pa && pb);
   }
-  document.getElementById("jitterstate").textContent =
-    active === "A" ? "LEG A" : active === "B" ? "LEG B"
-    : active === "off" ? "off" : "–";
 }
 
 async function setJitter(target) {
@@ -910,12 +904,11 @@ async function toggle(leg, func, el) {
   refresh();
 }
 
-async function resend(leg) {
+async function resendDev() {
   try {
     const r = await (await fetch("/api/resend", {method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({leg})})).json();
-    if (!r.ok) toast("LEG "+leg+": "+r.msg);
+      headers:{"Content-Type":"application/json"}, body: "{}"})).json();
+    if (!r.ok) toast("Resend: " + r.msg);
   } catch (e) { toast("Server unreachable"); }
   refresh();
 }
@@ -963,17 +956,20 @@ SETUP_HTML = """<!doctype html>
   <a href="/">&#8592; back to control</a>
 </header>
 <form method="post">
-  <h3 style="border:none;padding:0;margin-top:0">Devices</h3>
-  <label>LEG A – IP / host</label>
-  <input name="host_A" value="{{ cfg['hosts']['A'] }}">
-  <label>LEG B – IP / host</label>
-  <input name="host_B" value="{{ cfg['hosts']['B'] }}">
+  <h3 style="border:none;padding:0;margin-top:0">Device (jitter box)</h3>
+  <label>IP / host</label>
+  <input name="host" value="{{ cfg['host'] }}">
+  <div class="hint">the p_cap impairment device sitting in the jitter VLAN</div>
 
   <h3>Impairment values</h3>
   <label>Min. delay (ns)</label>
   <input name="min_delay_ns" value="{{ cfg['min_delay_ns'] }}">
   <div class="hint">always sent, e.g. 1'000'000</div>
-  <label>Min delay – instance</label>
+  <label>Jitter (value)</label>
+  <input name="jitter_on" value="{{ cfg['jitter_on'] }}">
+  <div class="hint">sent to the device together with the min delay; which leg is
+    affected is chosen with the jitter selector on the main page</div>
+  <label>p_cap instance</label>
   <select name="inst_jitter">
     {% for v in ['0', '1', 'both'] %}<option value="{{ v }}"
       {% if cfg['instances']['jitter'] == v %}selected{% endif %}>{{ v }}</option>{% endfor %}
@@ -1092,11 +1088,11 @@ def setup():
         error = None
         if request.method == "POST":
             try:
-                cfg["hosts"]["A"] = request.form["host_A"].strip()
-                cfg["hosts"]["B"] = request.form["host_B"].strip()
+                cfg["host"] = request.form["host"].strip()
                 cfg["api_path"] = request.form["api_path"].strip() or DEFAULT_CONFIG["api_path"]
                 cfg["mode"] = parse_number(request.form["mode"])
                 cfg["min_delay_ns"] = parse_number(request.form["min_delay_ns"])
+                cfg["jitter_on"] = parse_number(request.form["jitter_on"])
                 cfg["packetloss_kpps"] = parse_number(request.form["packetloss_kpps"])
                 cfg["jitter_vlan"] = parse_number(request.form["jitter_vlan"])
                 cfg["native_vlans"]["A"] = parse_number(request.form["native_vlan_A"])
@@ -1120,9 +1116,9 @@ def setup():
                 error = "Invalid number – please check your input."
             if not error:
                 save_config(cfg)
-                log_line("Setup saved – sending current values to both legs")
+                log_line("Setup saved – sending device values and storm-control state")
+                send_command(cfg)
                 for leg in LEGS:
-                    send_command(cfg, leg, cfg["state"][leg])
                     if storm_control_configured(cfg, leg):
                         send_storm_control(cfg, leg, cfg["state"][leg]["packetloss"])
                 return redirect("/")
