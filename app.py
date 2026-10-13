@@ -32,11 +32,11 @@ DEFAULT_CONFIG = {
     "hosts": {"A": "192.168.1.10", "B": "192.168.1.11"},
     "api_path": "/api/p_cap/instances/{instance}/mode_command",
     "mode": 1,
-    "instances": {"packetloss": "1", "jitter": "1"},   # each: "0" | "1" | "both"
+    "instances": {"jitter": "1"},   # "0" | "1" | "both"
     "polling": True,   # periodic status queries (ping / eAPI / Hue)
     "min_delay_ns": 1000000,
     "jitter_on": 0,
-    "packetloss_on": 0.0007,
+    "packetloss_kpps": 109,   # storm-control multicast pps limit, in kpps (1 stream ≈ 109)
     "state": {leg: {f: False for f in FUNCS} for leg in LEGS},
     "ptp": {"switch": "", "username": "", "password": "",
             "interfaces": {"gmB2": "Ethernet47", "gmB3": "Ethernet48",
@@ -59,7 +59,7 @@ def load_config():
     try:
         with open(CONFIG_FILE) as f:
             saved = json.load(f)
-        for key in ("api_path", "mode", "min_delay_ns", "jitter_on", "packetloss_on"):
+        for key in ("api_path", "mode", "min_delay_ns", "jitter_on", "packetloss_kpps"):
             if key in saved:
                 cfg[key] = saved[key]
         for leg in LEGS:
@@ -81,9 +81,8 @@ def load_config():
                 cfg["ptp"]["labels"][k] = val
         for key in ("bridge", "key", "light"):
             cfg["hue"][key] = saved.get("hue", {}).get(key, cfg["hue"][key])
-        for f in FUNCS:
-            val = saved.get("instances", {}).get(f, cfg["instances"][f])
-            cfg["instances"][f] = val if val in ("0", "1", "both") else "1"
+        val = saved.get("instances", {}).get("jitter", cfg["instances"]["jitter"])
+        cfg["instances"]["jitter"] = val if val in ("0", "1", "both") else "1"
         cfg["polling"] = bool(saved.get("polling", True))
     except (OSError, ValueError):
         pass
@@ -113,23 +112,17 @@ def log_line(text):
 
 # ---------------------------------------------------------------- device API
 def target_instances(cfg):
-    """All p_cap instances addressed by the current instance settings."""
-    insts = set()
-    for f in FUNCS:
-        sel = cfg["instances"][f]
-        insts |= {"0", "1"} if sel == "both" else {sel}
-    return sorted(insts)
+    """All p_cap instances addressed by the jitter instance setting."""
+    sel = cfg["instances"]["jitter"]
+    return ["0", "1"] if sel == "both" else [sel]
 
 
 def build_body(cfg, state, inst):
-    """Command body for one instance: a value is only set if its function is ON
-    and configured to target this instance, otherwise 0."""
-    def active(f):
-        sel = cfg["instances"][f]
-        return state[f] and (sel == "both" or sel == inst)
-    jitter = cfg["jitter_on"] if active("jitter") else 0
-    loss = cfg["packetloss_on"] if active("packetloss") else 0
-    return json.dumps([cfg["mode"], [cfg["min_delay_ns"], jitter, loss]],
+    """Command body for one instance. Packet loss is done via storm-control on
+    the switch, so the loss position is always 0 here."""
+    sel = cfg["instances"]["jitter"]
+    jitter = cfg["jitter_on"] if state["jitter"] and (sel == "both" or sel == inst) else 0
+    return json.dumps([cfg["mode"], [cfg["min_delay_ns"], jitter, 0]],
                       separators=(",", ":"))
 
 
@@ -164,6 +157,29 @@ def send_command(cfg, leg, state):
         ok_all = ok_all and ok
         msgs.append(f"inst {inst}: {msg}")
     return ok_all, "; ".join(msgs)
+
+
+def storm_control_configured(cfg, leg):
+    return bool(cfg["ptp"]["switch"].strip()
+                and cfg["ptp"]["interfaces"]["leg" + leg].strip())
+
+
+def send_storm_control(cfg, leg, on):
+    """Packet loss via the switch: multicast pps limit on the leg's port."""
+    if not cfg["ptp"]["switch"].strip():
+        return False, "no switch configured"
+    intf = cfg["ptp"]["interfaces"]["leg" + leg].strip()
+    if not intf:
+        return False, f"no switch interface configured for LEG {leg}"
+    if on:
+        pps = int(round(float(cfg["packetloss_kpps"]) * 1000))
+        cmd = f"storm-control multicast level pps {pps}"
+    else:
+        cmd = "no storm-control multicast"
+    ok, res = eapi_call(cfg, ["enable", "configure", f"interface {intf}", cmd])
+    msg = "OK" if ok else str(res)
+    log_line(f"SWITCH  {intf} {cmd}  →  {msg}")
+    return ok, msg
 
 
 # ---------------------------------------------------------------- Arista eAPI
@@ -432,7 +448,10 @@ def api_toggle():
         cfg = load_config()
         new_state = dict(cfg["state"][leg])
         new_state[func] = not new_state[func]
-        ok, msg = send_command(cfg, leg, new_state)
+        if func == "packetloss":
+            ok, msg = send_storm_control(cfg, leg, new_state["packetloss"])
+        else:
+            ok, msg = send_command(cfg, leg, new_state)
         if ok:
             cfg["state"][leg] = new_state
             save_config(cfg)
@@ -449,6 +468,9 @@ def api_resend():
     with lock:
         cfg = load_config()
         ok, msg = send_command(cfg, leg, cfg["state"][leg])
+        if storm_control_configured(cfg, leg):
+            ok2, msg2 = send_storm_control(cfg, leg, cfg["state"][leg]["packetloss"])
+            ok, msg = ok and ok2, f"{msg}; storm-control: {msg2}"
         return jsonify({"ok": ok, "msg": msg, "state": cfg["state"]})
 
 
@@ -879,14 +901,10 @@ SETUP_HTML = """<!doctype html>
     {% for v in ['0', '1', 'both'] %}<option value="{{ v }}"
       {% if cfg['instances']['jitter'] == v %}selected{% endif %}>{{ v }}</option>{% endfor %}
   </select>
-  <label>Packet loss (value when ON)</label>
-  <input name="packetloss_on" value="{{ cfg['packetloss_on'] }}">
-  <div class="hint">0 is sent when OFF, e.g. 0.0007</div>
-  <label>Packet loss – instance</label>
-  <select name="inst_packetloss">
-    {% for v in ['0', '1', 'both'] %}<option value="{{ v }}"
-      {% if cfg['instances']['packetloss'] == v %}selected{% endif %}>{{ v }}</option>{% endfor %}
-  </select>
+  <label>Packet loss – storm-control level (kpps)</label>
+  <input name="packetloss_kpps" value="{{ cfg['packetloss_kpps'] }}">
+  <div class="hint">multicast pps limit on the leg's switch port when ON
+    (1 stream &#8776; 109 kpps); OFF removes the limit</div>
 
   <h3>Main PTP – Arista switch (eAPI)</h3>
   <label>Switch – IP / host</label>
@@ -996,10 +1014,9 @@ def setup():
                 cfg["mode"] = parse_number(request.form["mode"])
                 cfg["min_delay_ns"] = parse_number(request.form["min_delay_ns"])
                 cfg["jitter_on"] = parse_number(request.form["jitter_on"])
-                cfg["packetloss_on"] = parse_number(request.form["packetloss_on"])
-                for f in FUNCS:
-                    val = request.form.get("inst_" + f, "1")
-                    cfg["instances"][f] = val if val in ("0", "1", "both") else "1"
+                cfg["packetloss_kpps"] = parse_number(request.form["packetloss_kpps"])
+                val = request.form.get("inst_jitter", "1")
+                cfg["instances"]["jitter"] = val if val in ("0", "1", "both") else "1"
                 cfg["ptp"]["switch"] = request.form["ptp_switch"].strip()
                 for k in PORT_KEYS:
                     cfg["ptp"]["interfaces"][k] = request.form.get("ptp_if_" + k, "").strip()
@@ -1020,6 +1037,8 @@ def setup():
                 log_line("Setup saved – sending current values to both legs")
                 for leg in LEGS:
                     send_command(cfg, leg, cfg["state"][leg])
+                    if storm_control_configured(cfg, leg):
+                        send_storm_control(cfg, leg, cfg["state"][leg]["packetloss"])
                 return redirect("/")
         return render_template_string(SETUP_HTML, cfg=cfg, error=error)
 

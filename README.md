@@ -14,8 +14,11 @@ docker compose up -d --build
 Then open `http://<docker-host>:9080` in your browser.
 
 - **Main page:** ping status of both legs (online/offline), plus one on/off switch each
-  for packet loss and jitter. ON sends the configured value, OFF sends 0 in that
-  position — the other value and the min delay are left untouched.
+  for packet loss and jitter. Jitter ON sends the configured value via the p_cap
+  mode_command (OFF sends 0). Packet loss is done on the Arista switch instead:
+  ON sets `storm-control multicast level pps <kpps*1000>` on the leg's switch
+  port, OFF removes the limit (`no storm-control multicast`). The kpps value is
+  configured in setup (1 stream ≈ 109 kpps).
 - **Setup:** IPs of the two legs, min. delay (ns), jitter and packet loss values
   (used when ON) and, per function, which p_cap instance they target (0, 1 or both);
   plus API path and mode. Saving sends the current target state to both legs.
